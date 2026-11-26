@@ -1,0 +1,7 @@
+# benchmark run: dismiss the splash, wait for the bench script to finish (Bonsai 27B loads ~20 min)
+wait:35
+key:spc
+wait:10
+key:spc
+serial:ZAI autostart:180
+serial:ZLRUN-DONE:3600

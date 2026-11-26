@@ -1,0 +1,22 @@
+// BENCHQ.ZC -- awzeal benchmark (Qwen3-0.6B): same prompt three times from a fresh context,
+// 128 new tokens each, every core ZealOS brought up. The host sweep reads the ZLOUT-END lines.
+#include "AILLM.ZC"
+
+U0 ZlBench()
+{
+	I64 i;
+	U8	msg[96];
+	if (AILLMLoad("ENGINE.BIN", "QWEN3.BIN"))
+	{
+		(*ZlStat)(100 + 128);
+		for (i = 0; i < 3; i++)
+		{
+			(*ZlReset)();
+			AIAsk("Write a detailed paragraph about how operating system schedulers share CPU time.");
+		}
+	}
+	StrPrint(msg, "ZLBENCH model=qwen3-0.6b cores=%d\n", zl.threads);
+	ZlSerPut(msg);
+	ZlSerPut("ZLRUN-DONE\n");
+}
+ZlBench;

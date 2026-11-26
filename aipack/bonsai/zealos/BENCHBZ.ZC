@@ -1,0 +1,22 @@
+// BENCHBZ.ZC -- awzeal benchmark (Bonsai, any ENGINE2 model on the disk): same prompt three
+// times from a fresh context, 32 new tokens each, every core ZealOS brought up.
+#include "AIBONSAI.ZC"
+
+U0 BzBench()
+{
+	I64 i;
+	U8	msg[96];
+	if (AIBonsaiLoad("ENGINE2.BIN", "BZ"))
+	{
+		(*ZlStat)(100 + 32);
+		for (i = 0; i < 3; i++)
+		{
+			(*ZlReset)();
+			AIAsk("Write a detailed paragraph about how operating system schedulers share CPU time.");
+		}
+	}
+	StrPrint(msg, "ZLBENCH model=bonsai cores=%d\n", zl.threads);
+	ZlSerPut(msg);
+	ZlSerPut("ZLRUN-DONE\n");
+}
+BzBench;
