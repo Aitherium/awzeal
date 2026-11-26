@@ -57,6 +57,8 @@ Bool AIBonsaiLoad(U8 *engine_path="ENGINE2.BIN", U8 *part_prefix="BZ")
 	ZlEnd	= zl.image + (zl.image(U32 *))[5];
 	ZlReset	= zl.image + (zl.image(U32 *))[6];
 	ZlStat	= zl.image + (zl.image(U32 *))[7];
+	ZlWorker	= zl.image + (zl.image(U32 *))[8];
+	ZlThreads	= zl.image + (zl.image(U32 *))[9];
 
 	bz_table = MAlloc(16 + 16 * BZ_MAX_PARTS, sys_task);
 	MemCopy(bz_table, "BZPARTS1", 8);
@@ -97,8 +99,9 @@ Bool AIBonsaiLoad(U8 *engine_path="ENGINE2.BIN", U8 *part_prefix="BZ")
 		return FALSE;
 	}
 	zl.ready = TRUE;
-	StrPrint(msg, "[AIBONSAI] ready: engine %d B, model %d parts %d MiB, ctx %d, vocab %d, arena %d MiB, load %0.2fs\n",
-			 zl.image_size, n, total >> 20, (*ZlStat)(1), (*ZlStat)(3), (*ZlStat)(2) >> 20, tS - t0);
+	AILLMThreads(0);
+	StrPrint(msg, "[AIBONSAI] ready: engine %d B, model %d parts %d MiB, ctx %d, vocab %d, arena %d MiB, cores %d, load %0.2fs\n",
+			 zl.image_size, n, total >> 20, (*ZlStat)(1), (*ZlStat)(3), (*ZlStat)(2) >> 20, zl.threads, tS - t0);
 	ZlLog(msg);
 	return TRUE;
 }

@@ -18,7 +18,7 @@ podman run --rm -v "$PACK:/pack:ro" -v "$OUT:/out" $IMG bash -c '
   # hosted harness (same engine source, hosted ABI)
   gcc $CF -c /pack/bonsai/engine/bonsai.c -o $B/bonsai_host.o
   gcc $CF -c /pack/bonsai/harness/harness.c -o $B/harness.o
-  gcc $B/harness.o $B/bonsai_host.o -o /out/harness -lm
+  gcc $B/harness.o $B/bonsai_host.o -o /out/harness -lm -lpthread
   # freestanding image
   gcc $CF $FREE -c /pack/bonsai/engine/bonsai.c -o $B/bonsai.o
   gcc $CF $FREE -c /pack/bonsai/engine/freestd.c -o $B/freestd.o

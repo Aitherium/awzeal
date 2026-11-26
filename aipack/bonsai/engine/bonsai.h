@@ -23,6 +23,8 @@ int64_t bz_next(uint8_t *buf, int64_t cap);               /* pending token bytes
 int64_t bz_end(void);                                     /* close the turn (<|im_end|>\n) -> ctx pos */
 int64_t bz_reset(void);                                   /* forget the conversation */
 int64_t bz_stat(int64_t which);                           /* 0 pos 1 ctx 2 arena used 3 vocab 4 n_gen 5 last token 6 arena needed; 100+n max tokens */
+int64_t bz_threads(int64_t n);                            /* cores per matmul (caller + n-1 workers) */
+int64_t bz_worker(int64_t tid);                           /* worker loop for CPU tid; returns after ~20 ms idle */
 
 /* lower-level entry points (parity harness) */
 int64_t bz_tokenize(const uint8_t *text, int64_t len, int32_t *out, int64_t cap);  /* raw text, no specials */

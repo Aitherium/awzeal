@@ -472,11 +472,13 @@ static float hsum8(__m256 v) {
 }
 
 /* out[t*ostride + r] = W[r] . x[t]  for r < M rows, t < T tokens; W is PQ2_0 [K, M] */
-static void mm_pq2(const wt_t *w, const qblk_t *xq, i64 xstride, i64 T, float *out, i64 ostride) {
+static void mm_pq2_rows(const wt_t *w, const qblk_t *xq, i64 xstride, i64 T, float *out, i64 ostride,
+                        i64 r0, i64 r1) {
     const i64 nb = w->ne0 / 128, Mr = w->ne1;
     const __m256i m3 = _mm256_set1_epi8(3);
     const __m256i ones = _mm256_set1_epi16(1);
-    for (i64 r = 0; r < Mr; r++) {
+    (void)Mr;
+    for (i64 r = r0; r < r1; r++) {
         const u8 *wr = w->data + r * nb * PQ_BLK;
         for (i64 t0 = 0; t0 < T; t0 += 4) {
             i64 nt = T - t0 < 4 ? T - t0 : 4;
@@ -513,6 +515,65 @@ static void mm_pq2(const wt_t *w, const qblk_t *xq, i64 xstride, i64 T, float *o
             if (nt > 3) out[(t0 + 3) * ostride + r] = hsum8(acc3);
         }
     }
+}
+
+/* ---- multi-core: the same generation/spin barrier as the Qwen3 engine --------------------
+ * ZealOS tasks pinned to CPUs 1..n-1 sit in bz_worker(tid); the caller runs slice 0.
+ * Rows are independent, so the split changes no arithmetic: output stays token-exact. */
+#define BZ_MAX_CPUS 64
+typedef struct { volatile u32 done; u8 pad[60]; } bz_flag_t;
+static volatile u32 tp_gen;
+static volatile i64 tp_n = 1;
+static const wt_t *tp_w;
+static i64 tp_T, tp_ostride;
+static float *tp_out;
+static bz_flag_t tp_done[BZ_MAX_CPUS] __attribute__((aligned(64)));
+
+static void tp_slice(i64 tid, i64 n, i64 M, i64 *r0, i64 *r1) {
+    *r0 = (M * tid) / n;
+    *r1 = (M * (tid + 1)) / n;
+}
+
+static void tp_run(i64 tid, i64 n) {
+    i64 r0, r1;
+    tp_slice(tid, n, tp_w->ne1, &r0, &r1);
+    if (r1 > r0)
+        mm_pq2_rows(tp_w, (const qblk_t *)b_q8, tp_w->ne0 / 128, tp_T, tp_out, tp_ostride, r0, r1);
+}
+
+static void mm_pq2(const wt_t *w, const qblk_t *xq, i64 xstride, i64 T, float *out, i64 ostride) {
+    i64 n = tp_n;
+    if (n <= 1 || xq != (const qblk_t *)b_q8 || xstride != w->ne0 / 128) {
+        mm_pq2_rows(w, xq, xstride, T, out, ostride, 0, w->ne1);
+        return;
+    }
+    tp_w = w; tp_T = T; tp_out = out; tp_ostride = ostride;
+    u32 g = __atomic_add_fetch(&tp_gen, 1, __ATOMIC_SEQ_CST);
+    tp_run(0, n);
+    for (i64 t = 1; t < n; t++)
+        while (__atomic_load_n(&tp_done[t].done, __ATOMIC_ACQUIRE) != g) __builtin_ia32_pause();
+}
+
+/* I64 ZlThreads(n) */
+i64 bz_threads(i64 n) {
+    if (n < 1) n = 1;
+    if (n > BZ_MAX_CPUS) n = BZ_MAX_CPUS;
+    tp_n = n;
+    return n;
+}
+
+/* I64 ZlWorker(tid): run slices until ~20 ms idle, then return so the task can Yield. */
+i64 bz_worker(i64 tid) {
+    i64 jobs = 0, idle = 4000000;
+    if (tid < 1 || tid >= BZ_MAX_CPUS) return -1;
+    while (idle-- > 0) {
+        u32 g = __atomic_load_n(&tp_gen, __ATOMIC_ACQUIRE);
+        if (g == tp_done[tid].done) { __builtin_ia32_pause(); continue; }
+        if (tid < tp_n) { tp_run(tid, tp_n); jobs++; }
+        __atomic_store_n(&tp_done[tid].done, g, __ATOMIC_RELEASE);
+        idle = 4000000;
+    }
+    return jobs;
 }
 
 /* f32 weight [K, M] times f32 activations (llama.cpp vec_dot_f32; DIVERGE: our summation order) */

@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include "../engine/bonsai.h"
 
@@ -47,6 +48,14 @@ static void top5(const float *l, int64_t nv) {
     printf("   top5:");
     for (int k = 0; k < 5; k++) printf(" %ld(%.4f)", (long)best[k], (double)l[best[k]] - lse);
     printf("\n");
+}
+
+/* BZ_THREADS=n: the same worker loop ZealOS runs per core, on pthreads (proves the split). */
+static volatile int g_stop;
+static void *worker(void *a) {
+    int64_t tid = (int64_t)(intptr_t)a;
+    while (!g_stop) bz_worker(tid);
+    return NULL;
 }
 
 int main(int argc, char **argv) {
@@ -95,6 +104,12 @@ int main(int argc, char **argv) {
     printf("bz_init rc=%ld %.2fs arena_used=%.1f MiB ctx=%ld vocab=%ld\n", (long)rc, t1 - t0,
            bz_stat(2) / 1048576.0, (long)bz_stat(1), (long)bz_stat(3));
     if (rc < 0) return 1;
+    int nth = getenv("BZ_THREADS") ? atoi(getenv("BZ_THREADS")) : 1;
+    if (nth > 1) {
+        static pthread_t th[64];
+        for (int64_t t = 1; t < nth && t < 64; t++) pthread_create(&th[t], NULL, worker, (void *)(intptr_t)t);
+        printf("threads=%ld\n", (long)bz_threads(nth));
+    }
     const char *mode = argv[2];
     static int32_t ids[8192];
     if (!strcmp(mode, "tok") && argc > 3) {

@@ -117,8 +117,8 @@ U8 *ZlReadAligned(U8 *name, I64 *_size)
 	while (b < blks)
 	{
 		n = blks - b;
-		if (n > 2048)
-			n = 2048;
+		if (n > 16384)	//8 MiB per FBlkRead: fewer round trips through the FAT32 + AHCI path
+			n = 16384;
 		FBlkRead(f, buf + b * BLK_SIZE, b, n);
 		b += n;
 		if ((b * BLK_SIZE) >> 26 != last_mb)

@@ -14,7 +14,7 @@ rm -rf "$W/aipack" && cp -r "$SRC" "$W/aipack"
 find "$W/aipack" -name '*.sh' -exec sed -i 's/\r$//' {} +
 verb=${1:-build}; shift || true
 run() {   # the harness runs in the build image with the model dir mounted read-only, one core
-  podman run --rm --cpuset-cpus=$CPU -e BZ_CTX="${BZ_CTX:-512}" -e BZ_ARENA_MB="${BZ_ARENA_MB:-448}" \
+  podman run --rm --cpuset-cpus=$CPU -e BZ_THREADS="${BZ_THREADS:-1}" -e BZ_CTX="${BZ_CTX:-512}" -e BZ_ARENA_MB="${BZ_ARENA_MB:-448}" \
     -v "$(dirname "$G"):/m:ro" -v "$W/out:/o:ro" localhost/zealos-bonsai-build:1 /o/harness "/m/$(basename "$G")" "$@"
 }
 case $verb in
