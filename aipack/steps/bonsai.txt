@@ -1,0 +1,10 @@
+# Bonsai 2.5 27B in a 12 GB guest: ~20 min to stream 7.3 GB of weights through FAT32
+wait:35
+key:spc
+wait:10
+key:spc
+serial:ZAI autostart:180
+serial:[AIBONSAI] ready:3000
+shot:bz-ready
+serial:ZLRUN-DONE:3000
+shot:bz-answers

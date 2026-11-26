@@ -12,6 +12,7 @@ STAGE=$W/stage
 rm -rf "$STAGE"; mkdir -p "$STAGE"
 cp "$W/out/ENGINE2.BIN" "$STAGE/"
 cp "$W/aipack/zealos/AILLM.ZC" "$W/aipack/bonsai/zealos/AIBONSAI.ZC" "$W/aipack/bonsai/zealos/RUN2.ZC" "$STAGE/"
+cp "$W/aipack/bonsai/zealos/RUN2.ZC" "$STAGE/RUN.ZC"   # the live autostart runs RUN.ZC
 NEED=$(python3 "$W/aipack/bonsai/tools/split_gguf.py" "$G" | awk '/model bytes used/{print $6}')
 SIZE_MB=$(( NEED / 1048576 + 512 ))
 rm -f "$IMG"; truncate -s ${SIZE_MB}M "$IMG"
