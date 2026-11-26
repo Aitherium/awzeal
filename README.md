@@ -14,6 +14,15 @@ The capital of Germany is Berlin.          <- follow-up turn, same KV cache
 ZLOUT-END prefill=20 tok 0.47s decode=7 tok 0.37s (18.96 tok/s) ctx=60/1024
 ```
 
+Bonsai 2.5 27B, inside ZealOS (12 GB guest, one core):
+
+```
+[AIBONSAI] ready: engine 1121152 B, model 7 parts 6917 MiB, ctx 2048, vocab 248320, arena 300 MiB, load 1229.81s
+The capital of France is **Paris**.
+The capital of Germany is **Berlin**.        <- follow-up turn, same state
+ZLOUT-END prefill=20 tok 13.30s decode=8 tok 7.71s (1.04 tok/s) ctx=57/2048
+```
+
 awzeal is a fork of [ZealOS](https://github.com/Zeal-Operating-System/ZealOS), which is itself a modernized fork of TempleOS. The upstream README is kept in [UPSTREAM-README.md](UPSTREAM-README.md).
 
 ## Run it
@@ -44,7 +53,7 @@ podman run --rm --device /dev/kvm -e AWZEAL_PROMPT="Write one sentence about ope
 | Multi-core inference | **works**: workers pinned to every core; 4 cores reach 25-32 tok/s |
 | Agent inference through the kernel `InferQueue` | **works**: FluxIDT + CapEngine + InferQueue JIT-compile at boot (`AIKERNEL.ZC`); a capability-checked `InferSync` from agent 1 completes on the `LOCAL_CPU` backend |
 | Syscall (INT 0x80 ring-3 gate; needs a rebuilt kernel) | source is in `src/Kernel`; the full fork-kernel build is not proven yet. The performance table in [ZEALOS-AI.md](ZEALOS-AI.md) is a design target, not a measurement |
-| Bonsai 2.5 27B (ternary, `qwen35` hybrid architecture) | **engine at parity**: `aipack/bonsai` (freestanding C, PQ2_0 + Hadamard, Gated DeltaNet + gated attention). Prompt tokens and the first 8 greedy tokens match llama.cpp exactly; 1.9 tok/s on one core on Linux. The in-ZealOS boot (12 GB guest, weights split into 7 FAT32 parts) is in progress |
+| Bonsai 2.5 27B (ternary, `qwen35` hybrid architecture) in ring 0 | **works**: `aipack/bonsai` (freestanding C engine, PQ2_0 + Hadamard, Gated DeltaNet + gated attention; token-exact against llama.cpp). Inside ZealOS on a 12 GB guest it answers "The capital of France is **Paris**." and then "...Germany is **Berlin**." at 1.04 tok/s on one core ([screen](aipack/evidence/bz-answers.png)) |
 
 ## How it works
 
@@ -79,7 +88,7 @@ The full walkthrough and the traps we hit are in [aipack/README.md](aipack/READM
 ## Roadmap
 
 1. Bake the AI layer into a rebuilt kernel (Syscall, agent scheduler on the timer ISR).
-2. Boot Bonsai 2.5 27B inside ZealOS, spread it across every core, and ship it as an `awzeal:bonsai` image variant.
+2. Spread Bonsai 27B across every core (today it is one core, about 1 tok/s), cut its 20-minute weight load, and ship it as an `awzeal:bonsai` image variant.
 
 ## Credits and licences
 
