@@ -8,7 +8,7 @@
 U0 ZlRunProof()
 {
 	ZlSerInit;
-	ZlLog("[AIKERNEL] compiled: FluxIDT + CapEngine + InferQueue\n");
+	ZlLog("[AIKERNEL] compiled: FluxIDT + CapEngine + InferQueue + AgentForge\n");
 	if (AILLMLoad("ENGINE.BIN", "QWEN3.BIN"))
 	{
 		AIAsk("What is the capital of France? Answer in one sentence.");
@@ -17,7 +17,13 @@ U0 ZlRunProof()
 			ZlLog("[AIINFER] PASS\n");
 		else
 			ZlLog("[AIINFER] FAIL\n");
+		if (AIAgentProof)
+			ZlLog("[AIAGENT] PASS\n");
+		else
+			ZlLog("[AIAGENT] FAIL\n");
 	}
 	ZlSerPut("ZLRUN-DONE\n");
 }
 ZlRunProof;
+if (zl.ready)
+	AISerialChat;

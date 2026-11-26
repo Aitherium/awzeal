@@ -278,3 +278,63 @@ U0 AIChat()
 		Free(line);
 	}
 }
+
+I64 ZlSerGetLine(U8 *buf, I64 cap)
+{// Blocking line read from COM1 (Yields while idle). Echoes, handles backspace.
+	I64 n = 0, c;
+	while (TRUE)
+	{
+		if (!(InU8(ZL_COM1 + 5) & 1))
+		{
+			Yield;
+			goto again;
+		}
+		c = InU8(ZL_COM1);
+		if (c == '\r' || c == '\n')
+		{
+			ZlSerPut("\n");
+			buf[n] = 0;
+			return n;
+		}
+		if ((c == 8 || c == 127) && n > 0)
+		{
+			n--;
+			OutU8(ZL_COM1, 8);
+			OutU8(ZL_COM1, ' ');
+			OutU8(ZL_COM1, 8);
+			goto again;
+		}
+		if (c >= ' ' && n < cap - 1)
+		{
+			buf[n++] = c;
+			OutU8(ZL_COM1, c);
+		}
+again:
+		c = c;
+	}
+}
+
+U0 AISerialChat()
+{// Chat over COM1: the awzeal container wires this to your terminal.
+	U8 line[1024];
+	ZlSerPut("\nawzeal> ring-0 Qwen3 ready. /reset /think /nothink\n");
+	while (TRUE)
+	{
+		ZlSerPut("you> ");
+		ZlSerGetLine(line, 1024);
+		if (!StrCompare(line, "/reset"))
+		{
+			(*ZlReset)();
+			ZlSerPut("[context cleared]\n");
+		}
+		else if (!StrCompare(line, "/think"))
+			zl.think = TRUE;
+		else if (!StrCompare(line, "/nothink"))
+			zl.think = FALSE;
+		else if (*line)
+		{
+			ZlSerPut("ai> ");
+			AIAsk(line);
+		}
+	}
+}

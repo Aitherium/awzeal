@@ -452,12 +452,14 @@ U0 AgentTick()
 	for (i = 0; i < AGENT_MAX_AGENTS; i++)
 	{
 		agent = kernel_state.agents[i];
-		if (!agent) continue;
-		if (!Bt(&agent->agent_flags, AGENTf_ACTIVE)) continue;
-		if (Bt(&agent->agent_flags, AGENTf_SUSPENDED)) continue;
+		if (!agent) goto at_n1;
+		if (!Bt(&agent->agent_flags, AGENTf_ACTIVE)) goto at_n1;
+		if (Bt(&agent->agent_flags, AGENTf_SUSPENDED)) goto at_n1;
 
 		kernel_state.running_count++;
 		kernel_state.system_pain += agent->pain;
+at_n1:
+		i = i;
 	}
 
 	if (kernel_state.running_count > 0)
@@ -476,30 +478,30 @@ U0 AgentTick()
 	for (i = 0; i < AGENT_MAX_AGENTS; i++)
 	{
 		agent = kernel_state.agents[i];
-		if (!agent) continue;
-		if (!Bt(&agent->agent_flags, AGENTf_ACTIVE)) continue;
-		if (Bt(&agent->agent_flags, AGENTf_SUSPENDED)) continue;
+		if (!agent) goto at_n2;
+		if (!Bt(&agent->agent_flags, AGENTf_ACTIVE)) goto at_n2;
+		if (Bt(&agent->agent_flags, AGENTf_SUSPENDED)) goto at_n2;
 
 		//Check cooldown
 		if (agent->cooldown > 0)
 		{
 			agent->cooldown--;
-			continue;
+			goto at_n2;
 		}
 
 		//Check budget
 		if (agent->hourly_used >= agent->hourly_budget)
-			continue;
+			goto at_n2;
 
 		for (j = 0; j < agent->task_count; j++)
 		{
 			at = &agent->tasks[j];
-			if (!at->action) continue;
+			if (!at->action) goto at_n3;
 
 			//Check interval
 			if (at->interval > 0 &&
 				(counts.jiffies - at->last_run) < at->interval)
-				continue;
+				goto at_n3;
 
 			score = AgentScoreTask(agent, at);
 			if (score > best_score)
@@ -508,7 +510,11 @@ U0 AgentTick()
 				best_agent = i;
 				best_task = j;
 			}
+at_n3:
+			j = j;
 		}
+at_n2:
+		i = i;
 	}
 
 	//Dispatch best task

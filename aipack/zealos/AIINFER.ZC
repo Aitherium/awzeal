@@ -36,9 +36,15 @@ Bool ZlInferLocal(CInferReq *req, CInferResp *resp)
 I64 AIInferInit()
 {// Bring up Flux + capabilities + the queue, register the local model, hook the backend.
 	I64 idx;
+	//Same order as the fork's KMain AI boot block. JIT globals are NOT zeroed,
+	//so kernel_state must be cleared before anything reads agents[].
+	MemSet(&kernel_state, 0, sizeof(CKernelState));
 	FluxInit;
 	CapEngineInit;
+	IdentityInit;
+	IdentitiesLoadDefaults;
 	InferQueueInit;
+	SlotPoolInit(0, mp_count, 4);
 	idx = ModelRegister(AI_LOCAL_MODEL, INFER_BACKEND_LOCAL_CPU, 0, ZL_CTX, 20.0, 4);
 	if (idx < 0)
 		return -1;
@@ -72,4 +78,49 @@ Bool AIInferProof(I64 agent_id=1)
 			 agent_id, req->status, resp->model_used, resp->tokens_used, resp->output);
 	ZlLog(msg);
 	return req->status == INFER_STATUS_COMPLETE;
+}
+
+//--- A spawned agent thinks on its own: AgentForge -> AgentTick -> task -> InferSync ---
+
+I64 ai_agent_think_status = 0;
+
+U0 ZlAgentThink(U8 *data)
+{// Agent task action. data = the CAgentMeta that owns the task.
+	CAgentMeta	*agent = data;
+	CInferReq	*req;
+	U8			*prompt = "You are a ZealOS kernel agent. In one short sentence, what is your job?",
+				 msg[INFER_OUTPUT_INLINE + 160];
+
+	req = InferSync(agent->agent_id, prompt, StrLen(prompt), AI_LOCAL_MODEL, 40);
+	if (!req)
+	{
+		ai_agent_think_status = -1;
+		return;
+	}
+	ai_agent_think_status = req->status;
+	StrPrint(msg, "[AIAGENT] %s#%d (role %d) status %d: %s\n", agent->name, agent->agent_id,
+			 agent->role, req->status, InferResp(req)->output);
+	ZlLog(msg);
+}
+
+Bool AIAgentProof()
+{// Identity -> spawn (role-based capability token) -> task -> scheduler tick dispatches it.
+	CAgentMeta *a;
+	U8			msg[128];
+
+	a = AgentSpawn("worker");
+	if (!a)
+	{
+		ZlLog("[AIAGENT] AgentSpawn(worker) failed\n");
+		return FALSE;
+	}
+	StrPrint(msg, "[AIAGENT] spawned %s#%d\n", a->name, a->agent_id);
+	ZlLog(msg);
+	if (!AgentTaskAdd(a->agent_id, 3, 0, &ZlAgentThink, a))
+	{
+		ZlLog("[AIAGENT] AgentTaskAdd failed\n");
+		return FALSE;
+	}
+	AgentTick;
+	return ai_agent_think_status == INFER_STATUS_COMPLETE;
 }
