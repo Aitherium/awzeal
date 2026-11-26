@@ -7,7 +7,7 @@ IMG=$W/aidisk.img
 STAGE=$W/stage
 rm -rf "$STAGE"; mkdir -p "$STAGE"
 cp "$W/out/ENGINE.BIN" "$STAGE/ENGINE.BIN"
-cp "$W/aipack/zealos/AILLM.ZC" "$W/aipack/zealos/RUN.ZC" "$STAGE/"
+for f in AILLM RUN AIKERNEL AIINFER; do cp "$W/aipack/zealos/$f.ZC" "$STAGE/"; done
 [ -s "$STAGE/QWEN3.BIN" ] || ln -f "$W/models/qwen3-0.6b-q8_0.asmbin" "$STAGE/QWEN3.BIN" 2>/dev/null || cp "$W/models/qwen3-0.6b-q8_0.asmbin" "$STAGE/QWEN3.BIN"
 rm -f "$IMG"
 truncate -s 1200M "$IMG"

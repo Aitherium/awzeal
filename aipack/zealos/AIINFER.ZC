@@ -1,0 +1,75 @@
+// AIINFER.ZC -- bridge the kernel AI layer's InferQueue to the ring-0 engine.
+// Needs AIKERNEL.ZC (or a fork kernel that has the AI layer) and AILLM.ZC.
+//
+// After AIInferInit, any agent with an "infer.*" EXECUTE capability can call
+//   req = InferSync(agent_id, prompt, len, "qwen3-0.6b", 128);
+//   InferResp(req)->output
+// and the request runs on this machine's CPU through the INFER_BACKEND_LOCAL_CPU path.
+
+#define AI_LOCAL_MODEL	"qwen3-0.6b"
+
+Bool ZlInferLocal(CInferReq *req, CInferResp *resp)
+{// infer_local_cpu_fp target: one fresh-context turn per request.
+	I64 n;
+	if (!zl.ready)
+		return FALSE;
+	if (req->prompt_len < INFER_PROMPT_INLINE)
+		req->prompt[req->prompt_len] = 0;
+	else
+		req->prompt[INFER_PROMPT_INLINE - 1] = 0;
+	(*ZlReset)();
+	if (req->max_tokens > 0)
+		(*ZlStat)(100 + req->max_tokens);
+	n = AIAsk(req->prompt, resp->output, INFER_OUTPUT_INLINE, FALSE);
+	(*ZlStat)(100 + 256);
+	if (n < 0)
+		return FALSE;
+	resp->req_id		= req->id;
+	resp->output_len	= StrLen(resp->output);
+	resp->tokens_used	= n;
+	resp->latency_tsc	= TSCGet - req->start_tsc;
+	resp->backend_used	= INFER_BACKEND_LOCAL_CPU;
+	StrCopy(resp->model_used, AI_LOCAL_MODEL);
+	return TRUE;
+}
+
+I64 AIInferInit()
+{// Bring up Flux + capabilities + the queue, register the local model, hook the backend.
+	I64 idx;
+	FluxInit;
+	CapEngineInit;
+	InferQueueInit;
+	idx = ModelRegister(AI_LOCAL_MODEL, INFER_BACKEND_LOCAL_CPU, 0, ZL_CTX, 20.0, 4);
+	if (idx < 0)
+		return -1;
+	infer_queue.models[idx].available	= zl.ready;
+	infer_queue.models[idx].loaded		= zl.ready;
+	infer_local_cpu_fp = &ZlInferLocal;
+	return idx;
+}
+
+Bool AIInferProof(I64 agent_id=1)
+{// Agent-path round trip: capability grant -> InferSync -> response slot. Logs to COM1.
+	CCapToken	*tok;
+	CInferReq	*req;
+	CInferResp	*resp;
+	U8			*prompt = "Name the largest planet in the solar system in one sentence.", msg[INFER_OUTPUT_INLINE + 160];
+
+	tok = CapTokenCreate(agent_id);
+	if (!tok || !CapTokenGrant(tok, "infer.*", CAPa_EXECUTE))
+	{
+		ZlLog("[AIINFER] capability grant failed\n");
+		return FALSE;
+	}
+	req = InferSync(agent_id, prompt, StrLen(prompt), AI_LOCAL_MODEL, 48);
+	if (!req)
+	{
+		ZlLog("[AIINFER] InferSync returned NULL (submit refused)\n");
+		return FALSE;
+	}
+	resp = InferResp(req);
+	StrPrint(msg, "[AIINFER] agent %d status %d model %s tokens %d: %s\n",
+			 agent_id, req->status, resp->model_used, resp->tokens_used, resp->output);
+	ZlLog(msg);
+	return req->status == INFER_STATUS_COMPLETE;
+}

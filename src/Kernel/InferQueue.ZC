@@ -18,6 +18,14 @@ Equivalent to AitherOS MicroScheduler:8150 but at syscall speed.
 */
 
 CInferQueue infer_queue;
+//Local CPU engine hook: set by /AIPack AILLM when an engine is loaded.
+//Fills InferResp(req) and returns TRUE on success.
+Bool (*infer_local_cpu_fp)(CInferReq *req, CInferResp *resp) = NULL;
+
+CInferResp *InferResp(CInferReq *req)
+{//Response slot paired with a request.
+	return &infer_queue.responses[(req(U8 *) - infer_queue.requests(U8 *)) / sizeof(CInferReq)];
+}
 
 U0 InferQueueInit()
 {//Initialize the inference queue to empty state.
@@ -98,7 +106,8 @@ CModelEntry *ModelAutoSelect(I64 effort, I64 agent_id)
 	for (i = 0; i < infer_queue.model_count; i++)
 	{
 		m = &infer_queue.models[i];
-		if (!m->available) continue;
+		if (!m->available)
+			goto ms_next;
 
 		//Score: balance quality against speed based on effort
 		//High effort ΓåÆ weight quality. Low effort ΓåÆ weight speed.
@@ -118,6 +127,8 @@ CModelEntry *ModelAutoSelect(I64 effort, I64 agent_id)
 			best_score = score;
 			best_idx = i;
 		}
+ms_next:
+		best_score = best_score;
 	}
 
 	if (best_idx >= 0)
@@ -280,7 +291,8 @@ CInferReq *InferPickNext()
 	for (i = 0; i < INFER_QUEUE_CAPACITY; i++)
 	{
 		req = &infer_queue.requests[i];
-		if (req->status != INFER_STATUS_QUEUED) continue;
+		if (req->status != INFER_STATUS_QUEUED)
+			goto pn_next;
 
 		//System priority always wins
 		if (Bt(&req->flags, INFERf_SYSTEM_PRIORITY))
@@ -291,6 +303,8 @@ CInferReq *InferPickNext()
 			best_priority = req->priority;
 			best_idx = i;
 		}
+pn_next:
+		best_priority = best_priority;
 	}
 
 	if (best_idx >= 0)
@@ -303,6 +317,7 @@ U0 InferDispatch()
 //Called periodically or when new requests arrive.
 	CInferReq	*req;
 	CModelEntry	*model;
+	I64			 latency;
 
 	req = InferPickNext;
 	if (!req) return;
@@ -343,7 +358,12 @@ U0 InferDispatch()
 			break;
 
 		case INFER_BACKEND_LOCAL_CPU:
-			//Phase 2: llama.cpp inference
+			//Phase 2: ring-0 engine (aipack AILLM) through infer_local_cpu_fp
+			if (infer_local_cpu_fp && (*infer_local_cpu_fp)(req, InferResp(req)))
+			{
+				req->status = INFER_STATUS_COMPLETE;
+				break;
+			}
 			req->status = INFER_STATUS_FAILED;
 			infer_queue.count--;
 			infer_queue.stats.total_failed++;
@@ -376,7 +396,7 @@ U0 InferDispatch()
 		model->total_requests++;
 
 		//Update running average latency
-		I64 latency = req->complete_tsc - req->start_tsc;
+		latency = req->complete_tsc - req->start_tsc;
 		if (infer_queue.stats.avg_latency_tsc == 0)
 			infer_queue.stats.avg_latency_tsc = latency;
 		else
@@ -443,6 +463,7 @@ U0 InferQueueDump()
 {//Print inference queue state.
 	I64 i;
 	CInferReq *req;
+	U8 *avail_st;
 
 	"=== Inference Queue (depth=%d/%d) ===\n",
 		infer_queue.count, INFER_QUEUE_CAPACITY;
@@ -450,7 +471,6 @@ U0 InferQueueDump()
 
 	for (i = 0; i < infer_queue.model_count; i++)
 	{
-		U8 *avail_st;
 		if (infer_queue.models[i].available)
 			avail_st = "YES";
 		else

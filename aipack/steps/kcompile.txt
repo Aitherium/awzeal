@@ -1,0 +1,7 @@
+wait:35
+key:spc
+wait:10
+key:spc
+serial:ZAI autostart:120
+serial:[AIKERNEL] compiled:120
+shot:k1-compiled

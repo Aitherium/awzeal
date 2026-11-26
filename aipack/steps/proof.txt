@@ -4,8 +4,7 @@ key:spc
 wait:10
 key:spc
 serial:ZAI autostart:120
-wait:15
-shot:p1-autostart
+serial:[AIKERNEL] compiled:120
 serial:[AILLM] ready:900
 shot:p2-ready
 serial:ZLRUN-DONE:600

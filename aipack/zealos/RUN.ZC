@@ -1,13 +1,22 @@
-// RUN.ZC -- boot-time proof: load the engine + model, answer two turns of one
-// conversation, report on COM1. Runs from the AI pack drive (the autostart Cd()s there).
+// RUN.ZC -- boot-time proof: load the kernel AI layer, the engine and the model,
+// answer two chat turns, then one agent request through InferQueue. Reports on COM1.
+// Runs from the AI pack drive (the autostart Cd()s there).
+#include "AIKERNEL.ZC"
 #include "AILLM.ZC"
+#include "AIINFER.ZC"
 
 U0 ZlRunProof()
 {
+	ZlSerInit;
+	ZlLog("[AIKERNEL] compiled: FluxIDT + CapEngine + InferQueue\n");
 	if (AILLMLoad("ENGINE.BIN", "QWEN3.BIN"))
 	{
 		AIAsk("What is the capital of France? Answer in one sentence.");
 		AIAsk("And what is the capital of Germany?");
+		if (AIInferInit >= 0 && AIInferProof(1))
+			ZlLog("[AIINFER] PASS\n");
+		else
+			ZlLog("[AIINFER] FAIL\n");
 	}
 	ZlSerPut("ZLRUN-DONE\n");
 }

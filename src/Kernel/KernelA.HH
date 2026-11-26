@@ -4944,6 +4944,7 @@ public class CInferQueue
 	U8			 default_model[INFER_MODEL_NAME_LEN];
 
 	CInferQueueStats stats;
+	CInferResp	 responses[INFER_QUEUE_CAPACITY]; //ZealOS-AI: one per request slot
 
 	//Per-agent rate limiting (requests per minute)
 	I64			 agent_rpm[AGENT_MAX_AGENTS];

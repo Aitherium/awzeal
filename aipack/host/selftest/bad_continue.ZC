@@ -1,0 +1,5 @@
+U0 F()
+{
+	I64 i;
+	for (i=0;i<3;i++) { if (i) continue; }
+}

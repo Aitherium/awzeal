@@ -151,7 +151,7 @@ Bool FluxUnsubscribe(I64 vector, U0 (*handler_fn)(CFluxEvent *event))
 		{
 			//Shift remaining handlers down
 			for (j = i; j < fv->handler_count - 1; j++)
-				fv->handlers[j] = fv->handlers[j + 1];
+				MemCopy(&fv->handlers[j], &fv->handlers[j + 1], sizeof(CFluxHandler));
 			fv->handler_count--;
 			fv->handlers[fv->handler_count].handler = NULL;
 			POPFD

@@ -4,7 +4,7 @@ ZealOS with an LLM running in ring 0. You boot it and the OS answers questions. 
 
 ![ZealOS-AI answering on the console](aipack/evidence/p3-answers.png)
 
-Measured 2026-11-26 on QEMU KVM, one core of a Ryzen 9 9950X3D:
+Measured 2026-11-26 on QEMU KVM, Ryzen 9 9950X3D (single-core run shown; 4 cores do 25-32 tok/s):
 
 ```
 [AILLM] ready: engine 552640 B, model 613 MiB, ctx 1024, vocab 151936, load 102.59s
@@ -24,8 +24,9 @@ This is a fork of [ZealOS](https://github.com/Zeal-Operating-System/ZealOS), whi
 | `AIAsk(prompt)` / `AIChat` from the ZealOS shell | **works** |
 | Boot-to-answer autostart from the live ISO | **works**: the autostart mounts the AI-pack SATA disk and runs it |
 | Answers mirrored to COM1 (`ZLOUT-BEGIN` / `ZLOUT-END`) | **works**: this is how CI and the host scripts verify a run |
-| Multi-core inference (ZealOS JobQueue) | in progress |
-| Agent kernel layer (FluxIDT, CapEngine, AgentForge, InferQueue): see [ZEALOS-AI.md](ZEALOS-AI.md) | source is in `src/Kernel`; its kernel build is not proven yet, and that doc's performance table is a design target, not a measurement |
+| Multi-core inference | **works**: workers pinned to every core; 4 cores reach 25-32 tok/s |
+| Agent inference through the kernel `InferQueue` | **works**: FluxIDT + CapEngine + InferQueue JIT-compile at boot (`AIKERNEL.ZC`); a capability-checked `InferSync` from agent 1 completes on the `LOCAL_CPU` backend |
+| AgentForge / Syscall (need a rebuilt kernel) | source is in `src/Kernel`; the full fork-kernel build is not proven yet. The performance table in [ZEALOS-AI.md](ZEALOS-AI.md) is a design target, not a measurement |
 | Bonsai 2.5 27B (ternary, `qwen35` hybrid architecture) | planned: needs a second engine |
 
 ## How it works
@@ -60,9 +61,8 @@ The full walkthrough and the traps we hit are in [aipack/README.md](aipack/READM
 
 ## Roadmap
 
-1. Use every core: shard the matmul and attention ranges across ZealOS CPUs with JobQueue.
-2. Make the kernel `InferQueue` / `InferSync` call the local engine, so spawned agents think locally.
-3. Run Bonsai 2.5 27B in ring 0, which needs a second engine for the `qwen35` architecture (Gated DeltaNet plus gated attention, Hadamard-rotated `PQ2_0` ternary weights, 8.3 GB).
+1. Spawn agents (AgentForge) on the same path once the fork kernel builds.
+2. Run Bonsai 2.5 27B in ring 0, which needs a second engine for the `qwen35` architecture (Gated DeltaNet plus gated attention, Hadamard-rotated `PQ2_0` ternary weights, 8.3 GB).
 
 ## Credits and licences
 

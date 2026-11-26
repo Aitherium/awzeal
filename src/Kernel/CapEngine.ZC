@@ -168,7 +168,7 @@ CCapToken *CapTokenNarrow(CCapToken *parent, I64 new_agent_id)
 
 	for (i = 0; i < parent->cap_count; i++)
 	{
-		child->caps[i] = parent->caps[i];
+		MemCopy(&child->caps[i], &parent->caps[i], sizeof(CCapability));
 	}
 	child->cap_count = parent->cap_count;
 	child->llm_tier_max = parent->llm_tier_max;
@@ -194,6 +194,7 @@ U0 CapTokenRevoke(I64 agent_id)
 U0 CapAuditDump(I64 count=10)
 {//Debug: print last N audit log entries.
 	I64 i, idx;
+	U8 *audit_res_st;
 
 	if (count > cap_engine.audit_count)
 		count = cap_engine.audit_count;
@@ -202,7 +203,6 @@ U0 CapAuditDump(I64 count=10)
 	for (i = 0; i < count; i++)
 	{
 		idx = (cap_engine.audit_head - count + i + CAP_MAX_AUDIT_LOG) % CAP_MAX_AUDIT_LOG;
-		U8 *audit_res_st;
 		if (cap_engine.audit_log[idx].result == CAP_AUDIT_ALLOW)
 			audit_res_st = "ALLOW";
 		else
