@@ -1,10 +1,12 @@
-/* bonsai.c -- Ternary Bonsai 2 (qwen35) forward pass, freestanding C (AVX2/FMA/F16C).
+/* bonsai.c -- Bonsai forward pass (qwen35 hybrid and qwen3 dense), freestanding C (AVX2/FMA/F16C).
  *
  * Runs the qwen35 hybrid at any width (27B: E 5120, Hadamard block 1024, version 1, separate
  * head; 4B: E 2560, block 512, version 2 tied latent head) with matmul weights in any of the
  * formats the Bonsai WebGPU kernels support: PQ2_0 (142) and its byte-identical Q2_0 (42),
  * PTQ1_0 (143) and Q1_0 (41). Every format goes through one row-split dispatch (mm_q ->
  * mm_rows -> bz_worker); per-block parity against the fork oracles is tests/kernel_test.c.
+ * general.architecture qwen3 selects the dense path instead (Bonsai Q1_0 1.7B / 4B): GQA attention
+ * with QK-norm and no gate, ffn_norm, YaRN RoPE when rope.scaling.type = yarn, qwen2 pre-tokenizer.
  *
  * Ground truth is the prism llama.cpp fork (src/models/qwen35.cpp, the ggml CPU ops
  * gated_delta_net / ssm_conv / l2_norm / rope_multi, src/llama-graph.cpp
@@ -233,6 +235,11 @@ typedef struct {
     i64 sign_w[8];
     i64 n_sign;
     int had_version, tied_output;
+    int dense;             /* qwen3: every layer plain GQA softmax attention, no gate, no DeltaNet */
+    int pre_qwen2;         /* tokenizer.ggml.pre = qwen2: \p{L}+ words, \p{M} counts as punctuation */
+    int yarn;              /* rope.scaling.type = yarn (ggml rope_yarn) */
+    float y_fs, y_ext, y_attn, y_beta_fast, y_beta_slow, y_corr0, y_corr1, y_mscale, rope_factor;
+    i64 y_ctx_orig, ctx_train;
     /* vocab */
     i64 n_vocab, n_merges;
     const u8 **tok_txt;
@@ -856,8 +863,21 @@ static void rope(float *x, i64 pos) {
     float theta = (float)pos;
     for (i64 i = 0; i < half; i++) {
         double sn, cs;
-        d_sincos((double)theta, &sn, &cs);
-        float c = (float)cs, s = (float)sn;
+        float th = theta, ms = 1.0f;
+        if (M.yarn) {   /* rope_yarn(theta_extrap = theta, freq_scale, corr_dims, i0 = 2i, ext, mscale) */
+            float ti = M.y_fs * theta;
+            th = ti;
+            ms = M.y_attn;
+            if (M.y_ext != 0.0f) {
+                float den = M.y_corr1 - M.y_corr0;
+                float y = ((float)i - M.y_corr0) / (den > 0.001f ? den : 0.001f);
+                float ramp = (1.0f - (y < 0.0f ? 0.0f : y > 1.0f ? 1.0f : y)) * M.y_ext;
+                th = ti * (1.0f - ramp) + theta * ramp;
+                ms = M.y_mscale;
+            }
+        }
+        d_sincos((double)th, &sn, &cs);
+        float c = (float)cs * ms, s = (float)sn * ms;
         float x0 = x[i], x1 = x[i + half];
         x[i] = x0 * c - x1 * s;
         x[i + half] = x0 * s + x1 * c;
@@ -880,7 +900,8 @@ static void embed(i32 id, float *x) {
 
 static void attn_layer(const layer_t *L, i64 T, i64 pos) {
     const i64 E = M.n_embd, H = M.n_head, HK = M.n_head_kv, D = M.head_dim;
-    const i64 QW = H * D * 2, KW = HK * D, OW = H * D;
+    const i64 QW = M.dense ? H * D : H * D * 2, KW = HK * D, OW = H * D;
+    const i64 QS = M.dense ? D : 2 * D;   /* gated qwen35 interleaves [q | gate] per head */
     prep_in(b_xn, E, T, E, &L->wq, b_h);
     matmul(&L->wq, T, b_big, QW);
     if (!same_prep(&L->wk, &L->wq)) prep_in(b_xn, E, T, E, &L->wk, b_h);
@@ -892,7 +913,7 @@ static void attn_layer(const layer_t *L, i64 T, i64 pos) {
     for (i64 t = 0; t < T; t++) {
         float *qf = b_big + t * QW;
         for (i64 h = 0; h < H; h++) {
-            float *q = qf + h * 2 * D;
+            float *q = qf + h * QS;
             rmsnorm(q, q, L->q_norm, D, M.eps);
             rope(q, pos + t);
         }
@@ -914,7 +935,7 @@ static void attn_layer(const layer_t *L, i64 T, i64 pos) {
         float *qf = b_big + t * QW;
         float *o = b_o + t * OW;
         for (i64 h = 0; h < H; h++) {
-            const float *q = qf + h * 2 * D;
+            const float *q = qf + h * QS;
             const float *gate = q + D;
             const i64 kh = h / grp;
             float mx = -3.0e38f;
@@ -938,7 +959,8 @@ static void attn_layer(const layer_t *L, i64 T, i64 pos) {
                 for (i64 i = 0; i < D; i += 8)
                     _mm256_storeu_ps(oh + i, _mm256_fmadd_ps(wp, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(vr + i))), _mm256_loadu_ps(oh + i)));
             }
-            for (i64 i = 0; i < D; i++) oh[i] *= f_sigmoid(gate[i]);
+            if (!M.dense)
+                for (i64 i = 0; i < D; i++) oh[i] *= f_sigmoid(gate[i]);
         }
     }
     prep_in(b_o, OW, T, OW, &L->wo, b_h);
@@ -1158,7 +1180,7 @@ static i64 bpe_word(const u32 *cp, i64 a, i64 b, i32 *out, i64 k, i64 cap) {
     return k;
 }
 
-/* qwen35 pre-tokenizer (unicode_regex_split_custom_qwen35), then BPE */
+/* qwen35 pre-tokenizer (unicode_regex_split_custom_qwen35) or the qwen2 regex, then BPE */
 i64 bz_tokenize(const u8 *text, i64 len, i32 *out, i64 cap) {
     if (len > MAX_PROMPT_BYTES) len = MAX_PROMPT_BYTES;
     const i64 n = utf8_decode(text, len, g_cpt, MAX_PROMPT_BYTES);
@@ -1166,6 +1188,8 @@ i64 bz_tokenize(const u8 *text, i64 len, i32 *out, i64 cap) {
 #define CPT(p) ((p) < n ? g_cpt[p] : OOR)
 #define FLG(p) ((p) < n ? cpt_flags(g_cpt[p]) : 0u)
     i64 k = 0, prev = 0, pos = 0;
+    /* qwen35: words are [\p{L}\p{M}]+ and \p{M} is not punctuation; qwen2: \p{L}+ and it is */
+    const u32 WL = M.pre_qwen2 ? FL : (FL | FM);
 #define ADD(e) do { if ((e) > prev) k = bpe_word(g_cpt, prev, (e), out, k, cap); prev = (e); } while (0)
     while (pos < n) {
         u32 c = CPT(pos);
@@ -1183,21 +1207,21 @@ i64 bz_tokenize(const u8 *text, i64 len, i32 *out, i64 cap) {
         /* [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+ */
         if (!(c == '\r' || c == '\n' || (f & FN))) {
             u32 f1 = FLG(pos + 1);
-            if ((f & (FL | FM)) || (f1 & (FL | FM))) {
+            if ((f & WL) || (f1 & WL)) {
                 pos++;
-                while (FLG(pos) & (FL | FM)) pos++;
+                while (FLG(pos) & WL) pos++;
                 ADD(pos);
                 continue;
             }
         }
         /* \p{N} */
         if (f & FN) { pos++; ADD(pos); continue; }
-        /* <space>?[^\s\p{L}\p{M}\p{N}]+[\r\n]* */
+        /* <space>?[^\s\p{L}\p{M}\p{N}]+[\r\n]*   (qwen2: [^\s\p{L}\p{N}]) */
         u32 f2 = c == ' ' ? FLG(pos + 1) : f;
-        if (!(f2 & (FW | FL | FM | FN)) && f) {
+        if (!(f2 & (FW | WL | FN)) && f) {
             pos += (c == ' ');
             /* (FLG/CPT are macros that name their argument twice: never pass ++pos) */
-            while (!(f2 & (FW | FL | FM | FN)) && f2) { pos++; f2 = FLG(pos); }
+            while (!(f2 & (FW | WL | FN)) && f2) { pos++; f2 = FLG(pos); }
             u32 c2 = CPT(pos);
             while (c2 == '\r' || c2 == '\n') { pos++; c2 = CPT(pos); }
             ADD(pos);
@@ -1347,31 +1371,51 @@ i64 bz_init(const u8 *model, u64 size, u8 *arena, u64 arena_size, i64 ctx) {
     u64 n_toks = 0, n_types = 0, n_merges = 0;
     M.eos = 248046; M.eot = 248044;
     M.fa_interval = 4;
+    float y_ext = -1.0f, y_attn = 1.0f, y_bf = 32.0f, y_bs = 1.0f;
+    int pre_ok = 1;
     for (i64 i = 0; i < nkv && !r.bad; i++) {
         u64 kl;
         const u8 *k = rd_str(&r, &kl);
         u32 t = (u32)rd_u(&r, 4);
+        /* "<arch>.<key>": ap = length of the arch prefix (qwen35 / qwen3), 0 = not an arch key */
+        u64 ap = (kl > 7 && bz_memeq(k, "qwen35.", 7)) ? 7 : (kl > 6 && bz_memeq(k, "qwen3.", 6)) ? 6 : 0;
 #define KEY(z) str_is(k, kl, z)
+#define AKEY(z) (ap && str_is(k + ap, kl - ap, z))
         if (KEY("general.architecture")) {
             u64 l; const u8 *s = rd_str(&r, &l);
-            arch_ok = str_is(s, l, "qwen35");
+            arch_ok = str_is(s, l, "qwen35") ? 1 : str_is(s, l, "qwen3") ? 2 : 0;
         } else if (KEY("general.alignment")) align = (u64)rd_int(&r, t);
-        else if (KEY("qwen35.block_count")) M.n_layer = rd_int(&r, t);
-        else if (KEY("qwen35.embedding_length")) M.n_embd = rd_int(&r, t);
-        else if (KEY("qwen35.feed_forward_length")) M.n_ff = rd_int(&r, t);
-        else if (KEY("qwen35.attention.head_count")) M.n_head = rd_int(&r, t);
-        else if (KEY("qwen35.attention.head_count_kv")) M.n_head_kv = rd_int(&r, t);
-        else if (KEY("qwen35.attention.key_length")) M.head_dim = rd_int(&r, t);
-        else if (KEY("qwen35.rope.dimension_count")) M.n_rot = rd_int(&r, t);
-        else if (KEY("qwen35.rope.freq_base")) M.rope_base = rd_f32(&r, t);
-        else if (KEY("qwen35.attention.layer_norm_rms_epsilon")) M.eps = rd_f32(&r, t);
-        else if (KEY("qwen35.ssm.conv_kernel")) M.conv_k = rd_int(&r, t);
-        else if (KEY("qwen35.ssm.state_size")) M.d_state = rd_int(&r, t);
-        else if (KEY("qwen35.ssm.group_count")) M.n_group = rd_int(&r, t);
-        else if (KEY("qwen35.ssm.time_step_rank")) M.dt_rank = rd_int(&r, t);
-        else if (KEY("qwen35.ssm.inner_size")) M.d_inner = rd_int(&r, t);
-        else if (KEY("qwen35.full_attention_interval")) M.fa_interval = rd_int(&r, t);
-        else if (KEY("qwen35.rope.dimension_sections") && t == 9) {
+        else if (KEY("tokenizer.ggml.pre") && t == 8) {
+            u64 l; const u8 *s = rd_str(&r, &l);
+            M.pre_qwen2 = str_is(s, l, "qwen2");
+            pre_ok = M.pre_qwen2 || str_is(s, l, "qwen35");
+        } else if (AKEY("rope.scaling.type") && t == 8) {
+            u64 l; const u8 *s = rd_str(&r, &l);
+            if (str_is(s, l, "yarn")) M.yarn = 1;
+            else if (!str_is(s, l, "none")) pre_ok = 0;   /* linear etc.: not implemented, refuse */
+        } else if (AKEY("rope.scaling.factor")) M.rope_factor = rd_f32(&r, t);
+        else if (AKEY("rope.scaling.original_context_length")) M.y_ctx_orig = rd_int(&r, t);
+        else if (AKEY("rope.scaling.yarn_ext_factor")) y_ext = rd_f32(&r, t);
+        else if (AKEY("rope.scaling.yarn_attn_factor")) y_attn = rd_f32(&r, t);
+        else if (AKEY("rope.scaling.yarn_beta_fast")) y_bf = rd_f32(&r, t);
+        else if (AKEY("rope.scaling.yarn_beta_slow")) y_bs = rd_f32(&r, t);
+        else if (AKEY("context_length")) M.ctx_train = rd_int(&r, t);
+        else if (AKEY("block_count")) M.n_layer = rd_int(&r, t);
+        else if (AKEY("embedding_length")) M.n_embd = rd_int(&r, t);
+        else if (AKEY("feed_forward_length")) M.n_ff = rd_int(&r, t);
+        else if (AKEY("attention.head_count")) M.n_head = rd_int(&r, t);
+        else if (AKEY("attention.head_count_kv")) M.n_head_kv = rd_int(&r, t);
+        else if (AKEY("attention.key_length")) M.head_dim = rd_int(&r, t);
+        else if (AKEY("rope.dimension_count")) M.n_rot = rd_int(&r, t);
+        else if (AKEY("rope.freq_base")) M.rope_base = rd_f32(&r, t);
+        else if (AKEY("attention.layer_norm_rms_epsilon")) M.eps = rd_f32(&r, t);
+        else if (AKEY("ssm.conv_kernel")) M.conv_k = rd_int(&r, t);
+        else if (AKEY("ssm.state_size")) M.d_state = rd_int(&r, t);
+        else if (AKEY("ssm.group_count")) M.n_group = rd_int(&r, t);
+        else if (AKEY("ssm.time_step_rank")) M.dt_rank = rd_int(&r, t);
+        else if (AKEY("ssm.inner_size")) M.d_inner = rd_int(&r, t);
+        else if (AKEY("full_attention_interval")) M.fa_interval = rd_int(&r, t);
+        else if (AKEY("rope.dimension_sections") && t == 9) {
             u32 et = (u32)rd_u(&r, 4); u64 n = rd_u(&r, 8);
             for (u64 j = 0; j < n; j++) { i64 v = rd_int(&r, et); if (j < 4) M.sections[j] = (i32)v; }
         } else if (KEY("prism.hadamard.block_size")) M.had_block = rd_int(&r, t);
@@ -1397,9 +1441,12 @@ i64 bz_init(const u8 *model, u64 size, u8 *arena, u64 arena_size, i64 ctx) {
         else if (KEY("tokenizer.ggml.padding_token_id")) M.eot = (i32)rd_int(&r, t);
         else rd_skip(&r, t);
 #undef KEY
+#undef AKEY
     }
     if (r.bad) return E_FORMAT;
     if (!arch_ok) return E_ARCH;
+    if (!pre_ok) return E_FORMAT;
+    M.dense = arch_ok == 2;
 
     g_ti = (tinfo_t *)ar_alloc(sizeof(tinfo_t) * (u64)nt);
     if (!g_ti) return E_OOM;
@@ -1417,15 +1464,42 @@ i64 bz_init(const u8 *model, u64 size, u8 *arena, u64 arena_size, i64 ctx) {
     if (r.bad) return E_FORMAT;
     g_data_start = ((u64)(r.p - g_part_ptr[0]) + align - 1) / align * align;
 
-    /* hparams sanity: the qwen35 shapes this code path handles (27B: E 5120, 4B: E 2560) */
-    if (M.n_layer <= 0 || M.n_layer > MAX_LAYERS || M.n_embd <= 0 || M.n_embd % 128 || M.head_dim % 8 || M.d_state % 8 ||
-        M.n_head % M.n_head_kv || M.dt_rank % M.n_group || M.conv_k < 2 || M.n_rot > M.head_dim)
+    if (M.n_rot == 0) M.n_rot = M.head_dim;   /* qwen3 GGUFs omit rope.dimension_count */
+    /* hparams sanity: qwen35 (27B: E 5120, 4B: E 2560) or dense qwen3 (Bonsai 1.7B / 4B) */
+    if (M.n_layer <= 0 || M.n_layer > MAX_LAYERS || M.n_embd <= 0 || M.n_embd % 128 || M.head_dim % 8 ||
+        M.head_dim <= 0 || M.n_head <= 0 || M.n_head_kv <= 0 || M.n_head % M.n_head_kv || M.n_rot > M.head_dim ||
+        M.n_rot % 2 || M.n_ff % 128)
         return E_SHAPE;
-    M.key_dim = M.d_state * M.n_group;
-    M.v_dim = M.d_inner;
-    M.conv_ch = 2 * M.key_dim + M.v_dim;
-    if (M.d_inner != M.d_state * M.dt_rank) return E_SHAPE;
+    if (!M.dense) {
+        if (M.d_state <= 0 || M.d_state % 8 || M.n_group <= 0 || M.dt_rank % M.n_group || M.conv_k < 2 ||
+            M.d_inner != M.d_state * M.dt_rank || M.fa_interval <= 0)
+            return E_SHAPE;
+        M.key_dim = M.d_state * M.n_group;
+        M.v_dim = M.d_inner;
+        M.conv_ch = 2 * M.key_dim + M.v_dim;
+    }
     if (M.eps <= 0) M.eps = 1e-6f;
+    if (M.yarn) {
+        /* llama.cpp: freq_scale = 1/factor, ext_factor 1 for YaRN (cparams default -1), attn_factor 1,
+         * beta_fast 32, beta_slow 1, n_ctx_orig = original_context_length (else n_ctx_train);
+         * ggml_rope_yarn_corr_dims and the mscale of rope_yarn */
+        if (!(M.rope_factor > 0.0f)) return E_FORMAT;
+        if (M.y_ctx_orig <= 0) M.y_ctx_orig = M.ctx_train;
+        if (M.y_ctx_orig <= 0) return E_FORMAT;
+        M.y_fs = 1.0f / M.rope_factor;
+        M.y_ext = y_ext < 0.0f ? 1.0f : y_ext;
+        M.y_attn = y_attn;
+        M.y_beta_fast = y_bf;
+        M.y_beta_slow = y_bs;
+        const double nd = (double)M.n_rot, lb = 2.0 * d_log((double)M.rope_base), tp = 2.0 * 3.14159265358979323846;
+        float c0 = (float)(nd * d_log((double)M.y_ctx_orig / ((double)y_bf * tp)) / lb);
+        float c1 = (float)(nd * d_log((double)M.y_ctx_orig / ((double)y_bs * tp)) / lb);
+        c0 = __builtin_floorf(c0);
+        c1 = __builtin_ceilf(c1);
+        M.y_corr0 = c0 > 0.0f ? c0 : 0.0f;
+        M.y_corr1 = c1 < (float)(M.n_rot - 1) ? c1 : (float)(M.n_rot - 1);
+        M.y_mscale = M.y_attn * (1.0f + 0.1f * (float)d_log(1.0 / (double)M.y_fs));
+    }
 
     /* Hadamard metadata: folded weight names, inverse table, sign vectors per width */
     if (wnames) {
@@ -1495,10 +1569,19 @@ i64 bz_init(const u8 *model, u64 size, u8 *arena, u64 arena_size, i64 ctx) {
     i64 na = 0, nr = 0;
     for (i64 il = 0; il < M.n_layer; il++) {
         layer_t *L = &M.L[il];
-        L->rec = ((il + 1) % M.fa_interval) != 0;
+        L->rec = !M.dense && ((il + 1) % M.fa_interval) != 0;
         L->attn_norm = get_f32(tname((int)il, "attn_norm.weight"), E);
-        L->post_norm = get_f32(tname((int)il, "post_attention_norm.weight"), E);
-        if (L->rec) {
+        /* the pre-FFN norm: qwen35 post_attention_norm, qwen3 ffn_norm */
+        L->post_norm = get_f32(tname((int)il, M.dense ? "ffn_norm.weight" : "post_attention_norm.weight"), E);
+        if (M.dense) {
+            L->slot = (int)na++;
+            L->wq = get_w(tname((int)il, "attn_q.weight"), E, H * D);
+            L->wk = get_w(tname((int)il, "attn_k.weight"), E, HK * D);
+            L->wv = get_w(tname((int)il, "attn_v.weight"), E, HK * D);
+            L->wo = get_w(tname((int)il, "attn_output.weight"), H * D, E);
+            L->q_norm = get_f32(tname((int)il, "attn_q_norm.weight"), D);
+            L->k_norm = get_f32(tname((int)il, "attn_k_norm.weight"), D);
+        } else if (L->rec) {
             L->slot = (int)nr++;
             L->wqkv = get_w(tname((int)il, "attn_qkv.weight"), E, M.conv_ch);
             L->wgate = get_w(tname((int)il, "attn_gate.weight"), E, M.v_dim);

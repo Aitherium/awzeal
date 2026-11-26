@@ -1,5 +1,5 @@
-/* bonsai.h -- freestanding Ternary Bonsai 2 engine (qwen35; PQ2_0/Q2_0/PTQ1_0/Q1_0 + Hadamard;
- * 27B and 4B shapes).
+/* bonsai.h -- freestanding Bonsai engine: qwen35 (Ternary Bonsai 2 27B / 4B, Hadamard) and qwen3
+ * dense (Bonsai 1.7B / 4B); PQ2_0/Q2_0/PTQ1_0/Q1_0 weights.
  *
  * One process-wide engine instance. Every entry point is SysV x86-64; the
  * ZealOS glue (glue2.asm) wraps them in the HolyC ABI. No libc: the engine
