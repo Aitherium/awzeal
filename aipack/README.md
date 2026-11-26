@@ -43,6 +43,5 @@ bash aipack/host/z.sh run @aipack/steps/proof.txt
 
 ## Next
 
-- Use every core through ZealOS `JobQueue`: shard `matmul_q8_0_range` and `gqa_attn_range` across CPUs. This is single-core today.
-- Wire `AIAsk` into the fork's kernel `InferQueue` / `InferSync` so agents (`AgentSpawn`) infer locally.
+- Done: every core works (`ZlWorker` tasks pinned per CPU). Agents infer locally through `InferQueue` (`AIINFER.ZC`, `AIKERNEL.ZC`).
 - Bonsai 2.5 27B has its own engine in `bonsai/` (ENGINE2.BIN, same ABI); it is at parity with llama.cpp on Linux, and its in-guest boot is in progress.
