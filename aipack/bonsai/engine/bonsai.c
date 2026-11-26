@@ -1,4 +1,10 @@
-/* bonsai.c -- Ternary-Bonsai-2.5-27B forward pass, freestanding C (AVX2/FMA/F16C).
+/* bonsai.c -- Ternary Bonsai 2 (qwen35) forward pass, freestanding C (AVX2/FMA/F16C).
+ *
+ * Runs the qwen35 hybrid at any width (27B: E 5120, Hadamard block 1024, version 1, separate
+ * head; 4B: E 2560, block 512, version 2 tied latent head) with matmul weights in any of the
+ * formats the Bonsai WebGPU kernels support: PQ2_0 (142) and its byte-identical Q2_0 (42),
+ * PTQ1_0 (143) and Q1_0 (41). Every format goes through one row-split dispatch (mm_q ->
+ * mm_rows -> bz_worker); per-block parity against the fork oracles is tests/kernel_test.c.
  *
  * Ground truth is the prism llama.cpp fork (src/models/qwen35.cpp, the ggml CPU ops
  * gated_delta_net / ssm_conv / l2_norm / rope_multi, src/llama-graph.cpp
@@ -167,9 +173,26 @@ static void *ar_alloc(u64 n) {
 
 /* ------------------------------------------------------------------ model description */
 
-#define TYPE_F32   0
-#define TYPE_PQ2_0 142
-#define PQ_BLK     34      /* f16 d + 32 bytes of 2-bit codes, 128 weights */
+#define TYPE_F32    0
+#define TYPE_Q1_0   41     /* Bonsai 1: f16 d + 16 bytes of sign bits (LSB first), +-d */
+#define TYPE_Q2_0   42     /* legacy Prism 2-bit: byte-identical to PQ2_0 */
+#define TYPE_PQ2_0  142
+#define TYPE_PTQ1_0 143    /* Bonsai 2 ternary: 24 B qs (5 trits) + 2 B qh (4 trits) + f16 d LAST */
+#define PQ_BLK      34     /* f16 d + 32 bytes of 2-bit codes, 128 weights */
+#define Q1_BLK      18
+#define PTQ1_BLK    28
+
+/* bytes per 128-weight block, 0 = not a matmul format this engine runs */
+static i64 blk_bytes(u32 t) {
+    switch (t) {
+    case TYPE_PQ2_0: case TYPE_Q2_0: return PQ_BLK;
+    case TYPE_PTQ1_0: return PTQ1_BLK;
+    case TYPE_Q1_0: return Q1_BLK;
+    default: return 0;
+    }
+}
+/* activation layout the format's kernel consumes: 0 = 2-bit interleave (PQ2_0/Q2_0), 1 = grouped */
+static int blk_nat(u32 t) { return t == TYPE_PTQ1_0 || t == TYPE_Q1_0; }
 
 typedef struct {
     const u8 *data;
@@ -206,7 +229,10 @@ typedef struct {
     const float *out_norm;
     int embd_inverse;
     layer_t L[MAX_LAYERS];
-    float *sign5120, *sign6144, *sign17408;
+    float *sign[8];        /* explicit sign vector per input width (prism.hadamard.sign_widths) */
+    i64 sign_w[8];
+    i64 n_sign;
+    int had_version, tied_output;
     /* vocab */
     i64 n_vocab, n_merges;
     const u8 **tok_txt;
@@ -346,8 +372,7 @@ static u64 t_bytes(const tinfo_t *t) {
     u64 n = 1;
     for (u32 i = 0; i < t->nd; i++) n *= t->ne[i];
     if (t->type == TYPE_F32) return n * 4;
-    if (t->type == TYPE_PQ2_0) return n / 128 * PQ_BLK;
-    return 0;
+    return n / 128 * (u64)blk_bytes(t->type);
 }
 
 static char g_nbuf[96];
@@ -385,7 +410,8 @@ static wt_t get_w(const char *name, i64 ne0, i64 ne1) {
     tinfo_t *t = find_t(name);
     if (!t) { g_err = E_TENSOR; return w; }
     if (t->nd != 2 || (i64)t->ne[0] != ne0 || (i64)t->ne[1] != ne1) { g_err = E_SHAPE; return w; }
-    if (t->type != TYPE_PQ2_0 && t->type != TYPE_F32) { g_err = E_FORMAT; return w; }
+    if (!blk_bytes(t->type) && t->type != TYPE_F32) { g_err = E_FORMAT; return w; }
+    if (t->type != TYPE_F32 && ne0 % 128) { g_err = E_SHAPE; return w; }
     w.data = file_ptr(g_data_start + t->off, t_bytes(t));
     if (!w.data) g_err = E_PARTS;
     w.ne0 = ne0; w.ne1 = ne1; w.type = t->type; w.folded = t->folded;
@@ -428,15 +454,22 @@ static i64 merge_rank(const u8 *a, u64 na, const u8 *b, u64 nb) {
 
 /* ------------------------------------------------------------------ kernels */
 
-/* one 128-wide activation block, Q8_0 per 32 (llama.cpp quantize_row_q8_0 arithmetic),
- * stored in the order the 2-bit weight unpack produces: q[s*32 + b] = x[4b + s] */
+/* one 128-wide activation block, Q8_0 per 32 (llama.cpp quantize_row_q8_0 arithmetic).
+ * Two layouts, chosen by the weight format that consumes it (blk_nat):
+ *   interleaved (PQ2_0/Q2_0): q[s*32 + b] = x[4b + s], the order the 2-bit unpack produces;
+ *       i32 lane L of the dot covers elements 16L..16L+15 -> sv/cv lane L = sub-block L/2.
+ *   grouped (PTQ1_0/Q1_0): element 32k + r at q[(r>>3)*32 + 8k + (r&7)], the order dec_ptq1 /
+ *       dec_q1 emit; i32 lane L covers sub-block L/2 (r&7 < 4 for even L) -> sv lane L = d[L/2].
+ * Both keep each i32 lane inside one Q8_0 sub-block, so one dot core (PQ_DOT) serves all.
+ * Every weight code is stored biased by +1 (value = code - 1), so cv = d * sum(q of the lane's
+ * elements) removes the bias after the unsigned x signed maddubs. */
 typedef struct {
     i8 q[128];
-    float sv[8];           /* per 32-lane-pair scale: d of sub-block lane/2 */
-    float cv[8];           /* d * sum(q) / 2 per lane: removes the +1 weight code bias */
+    float sv[8];
+    float cv[8];
 } __attribute__((aligned(64))) qblk_t;
 
-static void quant_row(const float *x, i64 K, qblk_t *out) {
+static void quant_row(const float *x, i64 K, qblk_t *out, int nat) {
     for (i64 b = 0; b < K / 128; b++) {
         qblk_t *o = &out[b];
         const float *xb = x + b * 128;
@@ -449,17 +482,106 @@ static void quant_row(const float *x, i64 K, qblk_t *out) {
             }
             float d = amax / 127.0f;
             float id = d != 0.0f ? 1.0f / d : 0.0f;
-            int sum = 0;
+            int s0 = 0, s1 = 0;
             for (int j = 0; j < 32; j++) {
                 int q = f_round(xs[j] * id);
                 int e = k * 32 + j;
-                o->q[(e & 3) * 32 + (e >> 2)] = (i8)q;
-                sum += q;
+                if (nat) o->q[(j >> 3) * 32 + 8 * k + (j & 7)] = (i8)q;
+                else o->q[(e & 3) * 32 + (e >> 2)] = (i8)q;
+                if ((j & 7) < 4) s0 += q; else s1 += q;
             }
             float dh = f16_to_f32(f32_to_f16(d));   /* block_q8_0 keeps d as ggml_half */
-            o->sv[2 * k] = o->sv[2 * k + 1] = dh;
-            o->cv[2 * k] = o->cv[2 * k + 1] = dh * (float)sum * 0.5f;
+            if (nat) {
+                o->sv[2 * k] = o->sv[2 * k + 1] = dh;
+                o->cv[2 * k] = dh * (float)s0;
+                o->cv[2 * k + 1] = dh * (float)s1;
+            } else {
+                o->sv[2 * k] = o->sv[2 * k + 1] = dh;
+                o->cv[2 * k] = o->cv[2 * k + 1] = dh * (float)(s0 + s1) * 0.5f;
+            }
         }
+    }
+}
+
+/* ---- weight decoders for the grouped layout: 128 codes (value + 1) as 4 x 32 bytes -------- */
+
+/* xi = ((u8)(byte * 3^n) * 3) >> 8 on 16-bit lanes (dequantize_row_ptq1_0, ggml-quants.c:2255).
+ * mult holds 3^n << 8: the low 16 bits of byte * (3^n << 8) are (u8)(byte * 3^n) << 8, so the
+ * mod 256 is free, and mulhi(t, 3) = (t * 3) >> 16 = ((u8)(byte * 3^n) * 3) >> 8. */
+static inline __m256i ptq1_trit16(__m256i v, __m256i mult) {
+    return _mm256_mulhi_epu16(_mm256_mullo_epi16(v, mult), _mm256_set1_epi16(3));
+}
+/* x[j] holds elements 16j..16j+15 (sub-block j/2) as u16; out[s] byte 8k + i = element 32k + 8s + i.
+ * packus(a, b) lays bytes as [a.lo128 | b.lo128 | a.hi128 | b.hi128] in 8-byte runs, so a carries
+ * sub-blocks 0 and 2, b sub-blocks 1 and 3. */
+static inline void group16(const __m256i x[8], __m256i out[4]) {
+    out[0] = _mm256_packus_epi16(_mm256_permute2x128_si256(x[0], x[4], 0x20), _mm256_permute2x128_si256(x[2], x[6], 0x20));
+    out[1] = _mm256_packus_epi16(_mm256_permute2x128_si256(x[0], x[4], 0x31), _mm256_permute2x128_si256(x[2], x[6], 0x31));
+    out[2] = _mm256_packus_epi16(_mm256_permute2x128_si256(x[1], x[5], 0x20), _mm256_permute2x128_si256(x[3], x[7], 0x20));
+    out[3] = _mm256_packus_epi16(_mm256_permute2x128_si256(x[1], x[5], 0x31), _mm256_permute2x128_si256(x[3], x[7], 0x31));
+}
+
+/* PTQ1_0: element e < 80 is trit e>>4 of qs[e&15]; 80 <= e < 120 is trit (e-80)>>3 of
+ * qs[16 + (e&7)]; e >= 120 is trit (e-120)>>1 of qh[e&1] (the CPU stage walk {32,16,8}). */
+static inline void dec_ptq1(const u8 *b, __m256i out[4]) {
+    const __m256i v0 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)b));
+    /* bytes 12..27 of the block (stays inside it): qs[16..23] at 4..11, qh[0..1] at 12..13 */
+    const __m128i hi = _mm_loadu_si128((const __m128i *)(b + 12));
+    const __m256i v56 = _mm256_cvtepu8_epi16(_mm_shuffle_epi8(hi, _mm_setr_epi8(4, 5, 6, 7, 8, 9, 10, 11, 4, 5, 6, 7, 8, 9, 10, 11)));
+    const __m256i v7 = _mm256_cvtepu8_epi16(_mm_shuffle_epi8(hi, _mm_setr_epi8(4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 12, 13, 12, 13, 12, 13)));
+    __m256i x[8];
+    x[0] = ptq1_trit16(v0, _mm256_set1_epi16(256));
+    x[1] = ptq1_trit16(v0, _mm256_set1_epi16(768));
+    x[2] = ptq1_trit16(v0, _mm256_set1_epi16(2304));
+    x[3] = ptq1_trit16(v0, _mm256_set1_epi16(6912));
+    x[4] = ptq1_trit16(v0, _mm256_set1_epi16(20736));
+    x[5] = ptq1_trit16(v56, _mm256_setr_epi16(256, 256, 256, 256, 256, 256, 256, 256, 768, 768, 768, 768, 768, 768, 768, 768));
+    x[6] = ptq1_trit16(v56, _mm256_setr_epi16(2304, 2304, 2304, 2304, 2304, 2304, 2304, 2304, 6912, 6912, 6912, 6912, 6912, 6912, 6912, 6912));
+    x[7] = ptq1_trit16(v7, _mm256_setr_epi16(20736, 20736, 20736, 20736, 20736, 20736, 20736, 20736, 256, 256, 768, 768, 2304, 2304, 6912, 6912));
+    group16(x, out);
+}
+
+/* Q1_0: bit j of qs (LSB first) -> code 2 (+d) or 0 (-d). out[s] byte 8k + i = element
+ * 32k + 8s + i = bit i of qs[4k + s]: one byte shuffle per vector, then a bit test. */
+static inline void dec_q1(const u8 *b, __m256i out[4]) {
+    const __m256i q = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(b + 2)));
+    const __m256i bm = _mm256_set1_epi64x(0x8040201008040201LL);
+    const __m256i two = _mm256_set1_epi8(2);
+    const __m256i sh0 = _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 4, 4, 4, 4, 4, 4,
+                                         8, 8, 8, 8, 8, 8, 8, 8, 12, 12, 12, 12, 12, 12, 12, 12);
+    const __m256i one = _mm256_set1_epi8(1);
+    __m256i sh = sh0;
+    for (int k = 0; k < 4; k++) {
+        __m256i v = _mm256_shuffle_epi8(q, sh);
+        out[k] = _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_and_si256(v, bm), bm), two);
+        sh = _mm256_add_epi8(sh, one);
+    }
+}
+
+/* scalar decoders (embedding rows, parity tests): value of element e in units of d */
+static float blk_d(const u8 *b, u32 type) {
+    const u8 *p = type == TYPE_PTQ1_0 ? b + 26 : b;
+    return f16_to_f32((u16)(p[0] | (p[1] << 8)));
+}
+static int blk_code(const u8 *b, u32 type, int e) {
+    if (type == TYPE_PTQ1_0) {
+        int byte, n;
+        if (e < 80) { byte = b[e & 15]; n = e >> 4; }
+        else if (e < 120) { byte = b[16 + ((e - 80) & 7)]; n = (e - 80) >> 3; }
+        else { byte = b[24 + ((e - 120) & 1)]; n = (e - 120) >> 1; }
+        int m = 1;
+        for (int i = 0; i < n; i++) m *= 3;
+        return ((((byte * m) & 0xFF)) * 3 >> 8) - 1;
+    }
+    if (type == TYPE_Q1_0) return (b[2 + (e >> 3)] >> (e & 7)) & 1 ? 1 : -1;
+    return ((b[2 + e / 4] >> ((e % 4) * 2)) & 3) - 1;   /* PQ2_0 / Q2_0 */
+}
+static void dequant_row(const u8 *row, u32 type, i64 K, float *x) {
+    const i64 bs = blk_bytes(type);
+    for (i64 b = 0; b < K / 128; b++) {
+        const u8 *wb = row + b * bs;
+        float d = blk_d(wb, type);
+        for (int j = 0; j < 128; j++) x[b * 128 + j] = (float)blk_code(wb, type, j) * d;
     }
 }
 
@@ -517,6 +639,47 @@ static void mm_pq2_rows(const wt_t *w, const qblk_t *xq, i64 xstride, i64 T, flo
     }
 }
 
+/* out[t*ostride + r] = W[r] . x[t], W PTQ1_0 or Q1_0 [K, M], grouped-layout activations.
+ * Each weight block is decoded once and dotted against every token of the batch with the
+ * same integer core as PQ2_0 (4 maddubs, one madd per 128 weights). */
+static void mm_nat_rows(const wt_t *w, const qblk_t *xq, i64 xstride, i64 T, float *out, i64 ostride,
+                        i64 r0, i64 r1) {
+    const i64 nb = w->ne0 / 128;
+    const int ptq = w->type == TYPE_PTQ1_0;
+    const i64 bs = ptq ? PTQ1_BLK : Q1_BLK;
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256 acc[BZ_TMAX];
+    if (T > BZ_TMAX) T = BZ_TMAX;
+    for (i64 r = r0; r < r1; r++) {
+        const u8 *wr = w->data + r * nb * bs;
+        for (i64 t = 0; t < T; t++) acc[t] = _mm256_setzero_ps();
+        for (i64 b = 0; b < nb; b++) {
+            const u8 *wb = wr + b * bs;
+            __m256i c[4];
+            u16 dh;
+            if (ptq) { dec_ptq1(wb, c); dh = (u16)(wb[26] | (wb[27] << 8)); }
+            else { dec_q1(wb, c); dh = (u16)(wb[0] | (wb[1] << 8)); }
+            const __m256 dw = _mm256_set1_ps(f16_to_f32(dh));
+            for (i64 t = 0; t < T; t++) {
+                const qblk_t *xb = xq + t * xstride + b;
+                __m256i p = _mm256_maddubs_epi16(c[0], _mm256_load_si256((const __m256i *)xb->q));
+                p = _mm256_add_epi16(p, _mm256_maddubs_epi16(c[1], _mm256_load_si256((const __m256i *)(xb->q + 32))));
+                p = _mm256_add_epi16(p, _mm256_maddubs_epi16(c[2], _mm256_load_si256((const __m256i *)(xb->q + 64))));
+                p = _mm256_add_epi16(p, _mm256_maddubs_epi16(c[3], _mm256_load_si256((const __m256i *)(xb->q + 96))));
+                __m256 f = _mm256_cvtepi32_ps(_mm256_madd_epi16(p, ones));
+                f = _mm256_fmsub_ps(f, _mm256_load_ps(xb->sv), _mm256_load_ps(xb->cv));
+                acc[t] = _mm256_fmadd_ps(dw, f, acc[t]);
+            }
+        }
+        for (i64 t = 0; t < T; t++) out[t * ostride + r] = hsum8(acc[t]);
+    }
+}
+
+static void mm_rows(const wt_t *w, const qblk_t *xq, i64 xstride, i64 T, float *out, i64 ostride, i64 r0, i64 r1) {
+    if (blk_nat(w->type)) mm_nat_rows(w, xq, xstride, T, out, ostride, r0, r1);
+    else mm_pq2_rows(w, xq, xstride, T, out, ostride, r0, r1);
+}
+
 /* ---- multi-core: the same generation/spin barrier as the Qwen3 engine --------------------
  * ZealOS tasks pinned to CPUs 1..n-1 sit in bz_worker(tid); the caller runs slice 0.
  * Rows are independent, so the split changes no arithmetic: output stays token-exact. */
@@ -538,13 +701,14 @@ static void tp_run(i64 tid, i64 n) {
     i64 r0, r1;
     tp_slice(tid, n, tp_w->ne1, &r0, &r1);
     if (r1 > r0)
-        mm_pq2_rows(tp_w, (const qblk_t *)b_q8, tp_w->ne0 / 128, tp_T, tp_out, tp_ostride, r0, r1);
+        mm_rows(tp_w, (const qblk_t *)b_q8, tp_w->ne0 / 128, tp_T, tp_out, tp_ostride, r0, r1);
 }
 
-static void mm_pq2(const wt_t *w, const qblk_t *xq, i64 xstride, i64 T, float *out, i64 ostride) {
+/* every quantised matmul, any format, goes through this one row-split dispatch */
+static void mm_q(const wt_t *w, const qblk_t *xq, i64 xstride, i64 T, float *out, i64 ostride) {
     i64 n = tp_n;
     if (n <= 1 || xq != (const qblk_t *)b_q8 || xstride != w->ne0 / 128) {
-        mm_pq2_rows(w, xq, xstride, T, out, ostride, 0, w->ne1);
+        mm_rows(w, xq, xstride, T, out, ostride, 0, w->ne1);
         return;
     }
     tp_w = w; tp_T = T; tp_out = out; tp_ostride = ostride;
@@ -612,32 +776,60 @@ static void fwht1024(float *x) {
             }
 }
 
+/* the same transform for any power-of-two block n >= 8 (prism.hadamard.block_size; 512 on the
+ * Bonsai 2 4B). Pre-scale is f32(1/sqrt(n)), computed in double like the TS reference. */
+static void fwht_n(float *x, i64 n) {
+    if (n == 1024) { fwht1024(x); return; }
+    const __m256 sc = _mm256_set1_ps((float)(1.0 / __builtin_sqrt((double)n)));
+    for (i64 i = 0; i < n; i += 8) _mm256_storeu_ps(x + i, _mm256_mul_ps(_mm256_loadu_ps(x + i), sc));
+    for (i64 len = 1; len < 8 && len < n; len <<= 1)
+        for (i64 i = 0; i < n; i += 2 * len)
+            for (i64 j = 0; j < len; j++) {
+                float u = x[i + j], v = x[i + j + len];
+                x[i + j] = u + v;
+                x[i + j + len] = u - v;
+            }
+    for (i64 len = 8; len < n; len <<= 1)
+        for (i64 i = 0; i < n; i += 2 * len)
+            for (i64 j = 0; j < len; j += 8) {
+                __m256 u = _mm256_loadu_ps(x + i + j), v = _mm256_loadu_ps(x + i + j + len);
+                _mm256_storeu_ps(x + i + j, _mm256_add_ps(u, v));
+                _mm256_storeu_ps(x + i + j + len, _mm256_sub_ps(u, v));
+            }
+}
+
 static const float *sign_for(i64 width) {
-    if (width == 5120) return M.sign5120;
-    if (width == 6144) return M.sign6144;
-    if (width == 17408) return M.sign17408;
+    for (i64 i = 0; i < M.n_sign; i++)
+        if (M.sign_w[i] == width) return M.sign[i];
     return 0;
 }
 
-/* activation for a matmul: (sign + blockwise WHT when folded), then Q8 blocks */
-static void prep_in(const float *x, i64 xstride, i64 T, i64 K, int folded, float *tmp) {
+/* a matmul whose weight wants the same transform + activation layout reuses b_q8 */
+static int same_prep(const wt_t *a, const wt_t *b) {
+    return a->folded == b->folded && blk_nat(a->type) == blk_nat(b->type);
+}
+
+/* activation for a matmul with weight w: (sign + blockwise WHT when folded), then Q8 blocks in
+ * the layout w's format consumes */
+static void prep_in(const float *x, i64 xstride, i64 T, i64 K, const wt_t *w, float *tmp) {
     qblk_t *q = (qblk_t *)b_q8;
     i64 nb = K / 128;
+    const int nat = blk_nat(w->type);
     const float *s = sign_for(K);
     for (i64 t = 0; t < T; t++) {
         const float *xt = x + t * xstride;
-        if (folded) {
+        if (w->folded) {
             for (i64 i = 0; i < K; i++) tmp[i] = xt[i] * s[i];
-            for (i64 b = 0; b < K; b += 1024) fwht1024(tmp + b);
-            quant_row(tmp, K, q + t * nb);
+            for (i64 b = 0; b < K; b += M.had_block) fwht_n(tmp + b, M.had_block);
+            quant_row(tmp, K, q + t * nb, nat);
         } else {
-            quant_row(xt, K, q + t * nb);
+            quant_row(xt, K, q + t * nb, nat);
         }
     }
 }
 
 static void matmul(const wt_t *w, i64 T, float *out, i64 ostride) {
-    mm_pq2(w, (const qblk_t *)b_q8, w->ne0 / 128, T, out, ostride);
+    mm_q(w, (const qblk_t *)b_q8, w->ne0 / 128, T, out, ostride);
 }
 
 /* ggml rms_norm (sum of float squares in double) followed by the weight multiply */
@@ -678,28 +870,22 @@ static void rope(float *x, i64 pos) {
 static void embed(i32 id, float *x) {
     const wt_t *w = &M.tok_embd;
     const i64 nb = w->ne0 / 128;
-    const u8 *row = w->data + (i64)id * nb * PQ_BLK;
-    for (i64 b = 0; b < nb; b++) {
-        const u8 *wb = row + b * PQ_BLK;
-        float d = f16_to_f32((u16)(wb[0] | (wb[1] << 8)));
-        for (int j = 0; j < 128; j++) {
-            int q = (wb[2 + j / 4] >> ((j % 4) * 2)) & 3;
-            x[b * 128 + j] = (float)(q - 1) * d;
-        }
-    }
+    dequant_row(w->data + (i64)id * nb * blk_bytes(w->type), w->type, w->ne0, x);
     if (M.embd_inverse) { /* h = s * (H z) */
-        for (i64 b = 0; b < w->ne0; b += 1024) fwht1024(x + b);
-        for (i64 i = 0; i < w->ne0; i++) x[i] *= M.sign5120[i];
+        const float *s = sign_for(w->ne0);
+        for (i64 b = 0; b < w->ne0; b += M.had_block) fwht_n(x + b, M.had_block);
+        for (i64 i = 0; i < w->ne0; i++) x[i] *= s[i];
     }
 }
 
 static void attn_layer(const layer_t *L, i64 T, i64 pos) {
     const i64 E = M.n_embd, H = M.n_head, HK = M.n_head_kv, D = M.head_dim;
     const i64 QW = H * D * 2, KW = HK * D, OW = H * D;
-    prep_in(b_xn, E, T, E, L->wq.folded, b_h);
+    prep_in(b_xn, E, T, E, &L->wq, b_h);
     matmul(&L->wq, T, b_big, QW);
-    if (L->wk.folded != L->wq.folded) prep_in(b_xn, E, T, E, L->wk.folded, b_h);
+    if (!same_prep(&L->wk, &L->wq)) prep_in(b_xn, E, T, E, &L->wk, b_h);
     matmul(&L->wk, T, b_k, KW);
+    if (!same_prep(&L->wv, &L->wk)) prep_in(b_xn, E, T, E, &L->wv, b_h);
     matmul(&L->wv, T, b_v, KW);
     u16 *kc = g_kcache + (i64)L->slot * g_ctx * KW;
     u16 *vc = g_vcache + (i64)L->slot * g_ctx * KW;
@@ -755,16 +941,16 @@ static void attn_layer(const layer_t *L, i64 T, i64 pos) {
             for (i64 i = 0; i < D; i++) oh[i] *= f_sigmoid(gate[i]);
         }
     }
-    prep_in(b_o, OW, T, OW, L->wo.folded, b_h);
+    prep_in(b_o, OW, T, OW, &L->wo, b_h);
     matmul(&L->wo, T, b_att, E);
 }
 
 static void rec_layer(const layer_t *L, i64 T) {
     const i64 E = M.n_embd, S = M.d_state, HV = M.dt_rank, HKk = M.n_group;
     const i64 CH = M.conv_ch, VD = M.v_dim, KD = M.key_dim, CK = M.conv_k;
-    prep_in(b_xn, E, T, E, L->wqkv.folded, b_h);
+    prep_in(b_xn, E, T, E, &L->wqkv, b_h);
     matmul(&L->wqkv, T, b_big, CH);
-    if (L->wgate.folded != L->wqkv.folded) prep_in(b_xn, E, T, E, L->wgate.folded, b_h);
+    if (!same_prep(&L->wgate, &L->wqkv)) prep_in(b_xn, E, T, E, &L->wgate, b_h);
     matmul(&L->wgate, T, b_z, VD);
     mm_f32(L->alpha, E, HV, b_xn, E, T, b_al, HV);
     mm_f32(L->beta, E, HV, b_xn, E, T, b_be, HV);
@@ -826,18 +1012,18 @@ static void rec_layer(const layer_t *L, i64 T) {
             bz_memcpy(o, p, VD * 4);
         }
     }
-    prep_in(b_o, VD, T, VD, L->wout.folded, b_h);
+    prep_in(b_o, VD, T, VD, &L->wout, b_h);
     matmul(&L->wout, T, b_att, E);
 }
 
 static void ffn(const layer_t *L, i64 T) {
     const i64 E = M.n_embd, F = M.n_ff;
-    prep_in(b_xn, E, T, E, L->fgate.folded, b_h);
+    prep_in(b_xn, E, T, E, &L->fgate, b_h);
     matmul(&L->fgate, T, b_g, F);
-    if (L->fup.folded != L->fgate.folded) prep_in(b_xn, E, T, E, L->fup.folded, b_h);
+    if (!same_prep(&L->fup, &L->fgate)) prep_in(b_xn, E, T, E, &L->fup, b_h);
     matmul(&L->fup, T, b_u, F);
     for (i64 i = 0; i < T * F; i++) b_g[i] = f_silu(b_g[i]) * b_u[i];
-    prep_in(b_g, F, T, F, L->fdown.folded, b_u);
+    prep_in(b_g, F, T, F, &L->fdown, b_u);
     matmul(&L->fdown, T, b_att, E);
 }
 
@@ -856,7 +1042,7 @@ static void forward_chunk(const i32 *ids, i64 T, i64 pos, int want_logits) {
     }
     if (want_logits) {
         rmsnorm(b_xn, b_x + (T - 1) * E, M.out_norm, E, M.eps);
-        prep_in(b_xn, E, 1, E, M.output.folded, b_h);
+        prep_in(b_xn, E, 1, E, &M.output, b_h);
         matmul(&M.output, 1, g_logits, M.n_vocab);
     }
 }
@@ -1010,9 +1196,10 @@ i64 bz_tokenize(const u8 *text, i64 len, i32 *out, i64 cap) {
         u32 f2 = c == ' ' ? FLG(pos + 1) : f;
         if (!(f2 & (FW | FL | FM | FN)) && f) {
             pos += (c == ' ');
-            while (!(f2 & (FW | FL | FM | FN)) && f2) f2 = FLG(++pos);
+            /* (FLG/CPT are macros that name their argument twice: never pass ++pos) */
+            while (!(f2 & (FW | FL | FM | FN)) && f2) { pos++; f2 = FLG(pos); }
             u32 c2 = CPT(pos);
-            while (c2 == '\r' || c2 == '\n') c2 = CPT(++pos);
+            while (c2 == '\r' || c2 == '\n') { pos++; c2 = CPT(pos); }
             ADD(pos);
             continue;
         }
@@ -1188,6 +1375,8 @@ i64 bz_init(const u8 *model, u64 size, u8 *arena, u64 arena_size, i64 ctx) {
             u32 et = (u32)rd_u(&r, 4); u64 n = rd_u(&r, 8);
             for (u64 j = 0; j < n; j++) { i64 v = rd_int(&r, et); if (j < 4) M.sections[j] = (i32)v; }
         } else if (KEY("prism.hadamard.block_size")) M.had_block = rd_int(&r, t);
+        else if (KEY("prism.hadamard.version")) M.had_version = (int)rd_int(&r, t);
+        else if (KEY("prism.hadamard.tied_output")) M.tied_output = (int)rd_int(&r, t);
         else if (KEY("prism.hadamard.gdn_v_grouped")) M.gdn_grouped = (int)rd_int(&r, t);
         else if (t == 9 && (KEY("prism.hadamard.sign_values") || KEY("prism.hadamard.sign_widths") ||
                             KEY("prism.hadamard.weight_names") || KEY("prism.hadamard.inverse_weight_names") ||
@@ -1228,8 +1417,8 @@ i64 bz_init(const u8 *model, u64 size, u8 *arena, u64 arena_size, i64 ctx) {
     if (r.bad) return E_FORMAT;
     g_data_start = ((u64)(r.p - g_part_ptr[0]) + align - 1) / align * align;
 
-    /* hparams sanity: this engine is the 27B shape's code path, not a generic qwen35 */
-    if (M.n_layer <= 0 || M.n_layer > MAX_LAYERS || M.n_embd != 5120 || M.head_dim % 8 || M.d_state % 8 ||
+    /* hparams sanity: the qwen35 shapes this code path handles (27B: E 5120, 4B: E 2560) */
+    if (M.n_layer <= 0 || M.n_layer > MAX_LAYERS || M.n_embd <= 0 || M.n_embd % 128 || M.head_dim % 8 || M.d_state % 8 ||
         M.n_head % M.n_head_kv || M.dt_rank % M.n_group || M.conv_k < 2 || M.n_rot > M.head_dim)
         return E_SHAPE;
     M.key_dim = M.d_state * M.n_group;
@@ -1246,8 +1435,13 @@ i64 bz_init(const u8 *model, u64 size, u8 *arena, u64 arena_size, i64 ctx) {
             for (i64 j = 0; j < nt; j++)
                 if (g_ti[j].nlen == l && bz_memeq(g_ti[j].name, s, l)) g_ti[j].folded = 1;
         }
-        if (M.had_block != 1024) return E_FORMAT;
+        /* a power of two the activation blocks tile: 1024 (27B) or 512 (4B) */
+        if (M.had_block < 128 || M.had_block > 4096 || (M.had_block & (M.had_block - 1))) return E_FORMAT;
     }
+    /* prism.hadamard.version 2 <=> tied_output: the head is the latent token_embd, read through
+     * the forward transform (it joins the forward table) */
+    if ((M.had_version == 2) != (M.tied_output != 0)) return E_FORMAT;
+    if (M.had_version > 2) return E_FORMAT;
     if (inames) {
         rd_t w = { inames, r.end, 0 };
         for (u64 i = 0; i < n_inames; i++) {
@@ -1261,7 +1455,7 @@ i64 bz_init(const u8 *model, u64 size, u8 *arena, u64 arena_size, i64 ctx) {
         u64 off = 0;
         for (u64 i = 0; i < n_sign_w; i++) {
             i32 width = (i32)(sign_w[4 * i] | (sign_w[4 * i + 1] << 8) | (sign_w[4 * i + 2] << 16) | ((u32)sign_w[4 * i + 3] << 24));
-            if (width <= 0 || off + (u64)width > n_sign_vals) return E_FORMAT;
+            if (width <= 0 || off + (u64)width > n_sign_vals || width % M.had_block || M.n_sign >= 8) return E_FORMAT;
             float *dst = (float *)ar_alloc((u64)width * 4);
             if (!dst) return E_OOM;
             for (i32 j = 0; j < width; j++) {
@@ -1269,12 +1463,13 @@ i64 bz_init(const u8 *model, u64 size, u8 *arena, u64 arena_size, i64 ctx) {
                 i32 v = (i32)(p[0] | (p[1] << 8) | (p[2] << 16) | ((u32)p[3] << 24));
                 dst[j] = (float)v;
             }
-            if (width == 5120) M.sign5120 = dst;
-            else if (width == 6144) M.sign6144 = dst;
-            else if (width == 17408) M.sign17408 = dst;
+            for (i64 k = 0; k < M.n_sign; k++)
+                if (M.sign_w[k] == width) return E_FORMAT;
+            M.sign[M.n_sign] = dst;
+            M.sign_w[M.n_sign++] = width;
             off += (u64)width;
         }
-        if (!M.sign5120 || !M.sign6144 || !M.sign17408) return E_FORMAT;
+        if (off != n_sign_vals) return E_FORMAT;
     }
 
     /* weights */
@@ -1285,9 +1480,17 @@ i64 bz_init(const u8 *model, u64 size, u8 *arena, u64 arena_size, i64 ctx) {
         M.n_vocab = (i64)te->ne[1];
     }
     M.tok_embd = get_w("token_embd.weight", E, M.n_vocab);
-    if (M.tok_embd.type != TYPE_PQ2_0) return E_FORMAT;
-    if (find_t("output.weight")) M.output = get_w("output.weight", E, M.n_vocab);
-    else M.output = M.tok_embd;                       /* tied (no inverse interaction: not our checkpoint) */
+    if (!blk_bytes(M.tok_embd.type)) return E_FORMAT;
+    if (find_t("output.weight")) {
+        if (M.tied_output) return E_FORMAT;
+        M.output = get_w("output.weight", E, M.n_vocab);
+    } else {
+        /* tied head. A latent (inverse-listed) table is only a valid head under tied_output,
+         * where the forward transform applies to it; otherwise it is a plain tied embedding */
+        if (M.embd_inverse && !M.tied_output) return E_FORMAT;
+        M.output = M.tok_embd;
+        M.output.folded = M.tied_output;
+    }
     M.out_norm = get_f32("output_norm.weight", E);
     i64 na = 0, nr = 0;
     for (i64 il = 0; il < M.n_layer; il++) {
@@ -1323,16 +1526,21 @@ i64 bz_init(const u8 *model, u64 size, u8 *arena, u64 arena_size, i64 ctx) {
     if (g_err) return g_err;
     M.n_attn = na;
     M.n_rec = nr;
-    /* every matmul weight must be PQ2_0 here (the F32 path covers only alpha/beta) */
+    /* every matmul weight must be a block format (PQ2_0/Q2_0/PTQ1_0/Q1_0; F32 covers only alpha/beta),
+     * and every folded input width needs its sign vector */
     for (i64 il = 0; il < M.n_layer; il++) {
         layer_t *L = &M.L[il];
         /* (no table of &L->w pointers: the vectoriser turns one into an absolute relocation) */
-        u32 bad = L->rec ? (L->wqkv.type ^ TYPE_PQ2_0) | (L->wgate.type ^ TYPE_PQ2_0) | (L->wout.type ^ TYPE_PQ2_0)
-                         : (L->wq.type ^ TYPE_PQ2_0) | (L->wk.type ^ TYPE_PQ2_0) | (L->wv.type ^ TYPE_PQ2_0) | (L->wo.type ^ TYPE_PQ2_0);
+        i64 bad = L->rec ? !blk_bytes(L->wqkv.type) | !blk_bytes(L->wgate.type) | !blk_bytes(L->wout.type)
+                         : !blk_bytes(L->wq.type) | !blk_bytes(L->wk.type) | !blk_bytes(L->wv.type) | !blk_bytes(L->wo.type);
         if (bad) return E_FORMAT;
-        if (L->fgate.type != TYPE_PQ2_0 || L->fup.type != TYPE_PQ2_0 || L->fdown.type != TYPE_PQ2_0) return E_FORMAT;
+        if (!blk_bytes(L->fgate.type) || !blk_bytes(L->fup.type) || !blk_bytes(L->fdown.type)) return E_FORMAT;
+        if ((L->fgate.folded && !sign_for(E)) || (L->fdown.folded && !sign_for(F))) return E_FORMAT;
+        if (L->rec && L->wout.folded && !sign_for(M.v_dim)) return E_FORMAT;
+        if (!L->rec && L->wo.folded && !sign_for(H * D)) return E_FORMAT;
     }
-    if (M.output.type != TYPE_PQ2_0) return E_FORMAT;
+    if (!blk_bytes(M.output.type)) return E_FORMAT;
+    if ((M.output.folded || M.embd_inverse) && !sign_for(E)) return E_FORMAT;
 
     /* vocab + merges */
     if (!toks || (i64)n_toks != M.n_vocab || !merges) return E_FORMAT;
@@ -1393,6 +1601,7 @@ i64 bz_init(const u8 *model, u64 size, u8 *arena, u64 arena_size, i64 ctx) {
     i64 big = QW > M.conv_ch ? QW : M.conv_ch;
     i64 wide = F > M.v_dim ? F : M.v_dim;
     if (wide < H * D) wide = H * D;
+    if (wide < E) wide = E;
     b_x = (float *)ar_alloc(4ull * (u64)(TM * E));
     b_xn = (float *)ar_alloc(4ull * (u64)(TM * E));
     b_h = (float *)ar_alloc(4ull * (u64)(wide > 16384 ? wide : 16384));

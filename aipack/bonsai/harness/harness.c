@@ -9,7 +9,7 @@
  *   harness <gguf> session "<question>"            ZlBegin/ZlNext/ZlEnd path (what ZealOS runs)
 
  *
- * env BZ_CTX (default 512), BZ_ARENA_MB (default 448).
+ * env BZ_CTX (default 512), BZ_ARENA_MB (default 448), BZ_THREADS (cores), BZ_THINK=1 (open <think>).
  */
 #define _GNU_SOURCE
 #include <fcntl.h>
@@ -120,7 +120,7 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(mode, "chat") && argc > 3) {
         int ngen = argc > 4 ? atoi(argv[4]) : 8;
-        int64_t n = bz_chat_ids((const uint8_t *)argv[3], 0, ids, 8192);
+        int64_t n = bz_chat_ids((const uint8_t *)argv[3], getenv("BZ_THINK") ? atoi(getenv("BZ_THINK")) : 0, ids, 8192);
         printf("prompt_ids");
         for (int64_t i = 0; i < n; i++) printf("%s%d", i ? "," : " ", ids[i]);
         printf("\n");

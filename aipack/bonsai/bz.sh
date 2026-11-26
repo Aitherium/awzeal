@@ -4,6 +4,7 @@
 #   ref [question]             reference ids/greedy tokens from the live server (read-only)
 #   tok "<text>" | chat "<q>" [n] [ref_ids] | session "<q>"   harness runs (one pinned core)
 #   split <out dir> [part_mb]  split the GGUF at tensor boundaries for FAT32
+#   env BZ_GGUF (default the 27B; the 4B: tools/run4b.sh), BZ_CPU cpuset, BZ_THREADS, BZ_THINK
 set -euo pipefail
 SRC=${ZPACK_SRC:-/mnt/c/AitherOS-Worktrees/zealos-ai/aipack}
 W=${ZWORK:-/root/zealos-ai/bonsai}
@@ -14,7 +15,7 @@ rm -rf "$W/aipack" && cp -r "$SRC" "$W/aipack"
 find "$W/aipack" -name '*.sh' -exec sed -i 's/\r$//' {} +
 verb=${1:-build}; shift || true
 run() {   # the harness runs in the build image with the model dir mounted read-only, one core
-  podman run --rm --cpuset-cpus=$CPU -e BZ_THREADS="${BZ_THREADS:-1}" -e BZ_CTX="${BZ_CTX:-512}" -e BZ_ARENA_MB="${BZ_ARENA_MB:-448}" \
+  podman run --rm --cpuset-cpus=$CPU -e BZ_THREADS="${BZ_THREADS:-1}" -e BZ_THINK="${BZ_THINK:-0}" -e BZ_CTX="${BZ_CTX:-512}" -e BZ_ARENA_MB="${BZ_ARENA_MB:-448}" \
     -v "$(dirname "$G"):/m:ro" -v "$W/out:/o:ro" localhost/zealos-bonsai-build:1 /o/harness "/m/$(basename "$G")" "$@"
 }
 case $verb in
