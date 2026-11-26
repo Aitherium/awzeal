@@ -1,0 +1,14 @@
+// RUN2.ZC -- boot-time proof for the Bonsai engine: load ENGINE2.BIN + BZnnn.BIN,
+// answer two turns of one conversation, report on COM1 (ZLOUT markers, as RUN.ZC).
+#include "AIBONSAI.ZC"
+
+U0 BzRunProof()
+{
+	if (AIBonsaiLoad("ENGINE2.BIN", "BZ"))
+	{
+		AIAsk("What is the capital of France?");
+		AIAsk("And what is the capital of Germany?");
+	}
+	ZlSerPut("ZLRUN-DONE\n");
+}
+BzRunProof;

@@ -1,0 +1,104 @@
+// AIBONSAI.ZC -- ring-0 Ternary-Bonsai-2.5-27B for ZealOS-AI.
+// Second engine behind the same AILLM front end: ENGINE2.BIN (bonsai.c + glue2.asm,
+// the same ZLE1 header and HolyC ABI as ENGINE.BIN) and the GGUF split at tensor
+// boundaries into BZ000.BIN, BZ001.BIN, ... (FAT32 caps a file at 4 GiB; the
+// model is 7.3 GB of tensors). Each part gets its own allocation; ZlInit receives
+// a BZPARTS1 table, so no allocation and no file ever has to hold the whole model.
+//
+//   #include "AIBONSAI";
+//   AIBonsaiLoad;                 // ENGINE2.BIN + BZnnn.BIN from the current dir
+//   AIAsk("What is the capital of France?");
+//   AIChat;
+//
+// Needs ~7.3 GiB for the weights plus BZ_ARENA_MB of arena (KV + DeltaNet state).
+
+#include "AILLM.ZC"
+
+#define BZ_MAX_PARTS	16
+#define BZ_CTX			2048
+#define BZ_ARENA_MB		640
+
+U8 *bz_table;	// "BZPARTS1", U64 n, then n x {U64 ptr, U64 len}
+
+Bool AIBonsaiLoad(U8 *engine_path="ENGINE2.BIN", U8 *part_prefix="BZ")
+{
+	U8	*file, name[64], msg[256], *part;
+	I64	 fsize, img, res, n = 0, total = 0, psize;
+	F64	 t0;
+
+	ZlSerInit;
+	ZlLog("[AIBONSAI] loading engine\n");
+	t0 = tS;
+	file = FileRead(engine_path, &fsize);
+	if (!file || fsize < 80 || MemCompare(file, "ZENG", 4))
+	{
+		ZlLog("[AIBONSAI] ENGINE2.BIN missing or bad magic\n");
+		return FALSE;
+	}
+	img = (file(U32 *))[1];
+	if ((file(U32 *))[2] || (file(U32 *))[3])
+	{
+		ZlLog("[AIBONSAI] ENGINE2.BIN carries relocations; this loader does not apply them\n");
+		Free(file);
+		return FALSE;
+	}
+	zl.image = MAllocAligned(img, 4096, sys_task);
+	MemCopy(zl.image, file + 64, img);
+	zl.image_size = img;
+	Free(file);
+	if (MemCompare(zl.image, "ZLE1", 4) || MemCompare(zl.image + 32, "BONSAI25", 8))
+	{
+		ZlLog("[AIBONSAI] engine image is not the ZLE1 Bonsai engine\n");
+		return FALSE;
+	}
+	ZlInit	= zl.image + (zl.image(U32 *))[2];
+	ZlBegin	= zl.image + (zl.image(U32 *))[3];
+	ZlNext	= zl.image + (zl.image(U32 *))[4];
+	ZlEnd	= zl.image + (zl.image(U32 *))[5];
+	ZlReset	= zl.image + (zl.image(U32 *))[6];
+	ZlStat	= zl.image + (zl.image(U32 *))[7];
+
+	bz_table = MAlloc(16 + 16 * BZ_MAX_PARTS, sys_task);
+	MemCopy(bz_table, "BZPARTS1", 8);
+	while (n < BZ_MAX_PARTS)
+	{
+		StrPrint(name, "%s%03d.BIN", part_prefix, n);
+		if (!FileFind(name))
+			break;
+		part = ZlReadAligned(name, &psize);
+		if (!part)
+			return FALSE;
+		(bz_table(U64 *))[2 + 2 * n] = part;
+		(bz_table(U64 *))[3 + 2 * n] = psize;
+		total += psize;
+		n++;
+	}
+	if (!n)
+	{
+		StrPrint(msg, "[AIBONSAI] no %s000.BIN model part found\n", part_prefix);
+		ZlLog(msg);
+		return FALSE;
+	}
+	(bz_table(U64 *))[1] = n;
+	zl.model = bz_table;
+	zl.model_size = total;
+	zl.arena_size = BZ_ARENA_MB << 20;
+	zl.arena = MAllocAligned(zl.arena_size, 4096, sys_task);
+	if (!zl.arena)
+	{
+		ZlLog("[AIBONSAI] cannot allocate the arena\n");
+		return FALSE;
+	}
+	res = (*ZlInit)(bz_table, total, zl.arena, zl.arena_size, BZ_CTX);
+	if (res < 0)
+	{
+		StrPrint(msg, "[AIBONSAI] bz_init failed: %d (needs %d MiB arena)\n", res, (*ZlStat)(6) >> 20);
+		ZlLog(msg);
+		return FALSE;
+	}
+	zl.ready = TRUE;
+	StrPrint(msg, "[AIBONSAI] ready: engine %d B, model %d parts %d MiB, ctx %d, vocab %d, arena %d MiB, load %0.2fs\n",
+			 zl.image_size, n, total >> 20, (*ZlStat)(1), (*ZlStat)(3), (*ZlStat)(2) >> 20, tS - t0);
+	ZlLog(msg);
+	return TRUE;
+}
