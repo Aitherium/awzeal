@@ -42,8 +42,8 @@ zl_header:
     dd zl_stat  - zl_header         ; +28  I64 ZlStat(I64 which)
     dd zl_worker - zl_header        ; +32  I64 ZlWorker(I64 tid)   per-core job loop
     dd zl_threads - zl_header       ; +36  I64 ZlThreads(I64 n)    cores per matmul
-    db "BONSAI25"                   ; +32  engine id
-    times 64 - ($ - zl_header) db 0
+    times 56 - ($ - zl_header) db 0  ; +40..+55 reserved: same slot meaning as ENGINE.BIN
+    db "BONSAI25"                   ; +56  engine id (last 8 header bytes, clear of every slot)
 
 %macro HC_ENTER 0
     push    rbp

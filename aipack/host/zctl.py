@@ -18,7 +18,7 @@ import sys
 import time
 
 W = "/root/zealos-ai"
-RUN = f"{W}/run"
+RUN = os.environ.get("ZRUN", f"{W}/run")
 EVID = os.environ.get("ZEVID", "/mnt/c/AitherOS-Worktrees/zealos-ai/aipack/evidence")
 KEYS = {" ": "spc", "\n": "ret", ";": "semicolon", ":": "shift-semicolon", '"': "shift-apostrophe",
         "'": "apostrophe", "/": "slash", ".": "dot", ",": "comma", "(": "shift-9", ")": "shift-0",
@@ -85,7 +85,7 @@ def main(argv):
            "-m", os.environ.get("ZRAM", "4G"), "-smp", os.environ.get("ZSMP", "4"),
            "-device", "ahci,id=ahci0",
            "-drive", f"id=cd,file={iso},media=cdrom,if=none", "-device", "ide-cd,drive=cd,bus=ahci0.0",
-           "-boot", "d", "-display", "vnc=127.0.0.1:41", "-vga", "std",
+           "-boot", "d", "-display", f"vnc=127.0.0.1:{os.environ.get('ZVNC', '41')}", "-vga", "std",
            "-serial", f"file:{serial}", "-monitor", f"unix:{mon_path},server,nowait",
            "-device", "isa-debug-exit,iobase=0x501,iosize=1", "-no-reboot"]
     if disk and os.path.exists(disk):

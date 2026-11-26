@@ -46,7 +46,7 @@ Bool AIBonsaiLoad(U8 *engine_path="ENGINE2.BIN", U8 *part_prefix="BZ")
 	MemCopy(zl.image, file + 64, img);
 	zl.image_size = img;
 	Free(file);
-	if (MemCompare(zl.image, "ZLE1", 4) || MemCompare(zl.image + 32, "BONSAI25", 8))
+	if (MemCompare(zl.image, "ZLE1", 4) || MemCompare(zl.image + 56, "BONSAI25", 8))
 	{
 		ZlLog("[AIBONSAI] engine image is not the ZLE1 Bonsai engine\n");
 		return FALSE;
