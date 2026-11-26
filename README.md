@@ -44,7 +44,7 @@ podman run --rm --device /dev/kvm -e AWZEAL_PROMPT="Write one sentence about ope
 | Multi-core inference | **works**: workers pinned to every core; 4 cores reach 25-32 tok/s |
 | Agent inference through the kernel `InferQueue` | **works**: FluxIDT + CapEngine + InferQueue JIT-compile at boot (`AIKERNEL.ZC`); a capability-checked `InferSync` from agent 1 completes on the `LOCAL_CPU` backend |
 | Syscall (INT 0x80 ring-3 gate; needs a rebuilt kernel) | source is in `src/Kernel`; the full fork-kernel build is not proven yet. The performance table in [ZEALOS-AI.md](ZEALOS-AI.md) is a design target, not a measurement |
-| Bonsai 2.5 27B (ternary, `qwen35` hybrid architecture) | planned: needs a second engine |
+| Bonsai 2.5 27B (ternary, `qwen35` hybrid architecture) | **engine at parity**: `aipack/bonsai` (freestanding C, PQ2_0 + Hadamard, Gated DeltaNet + gated attention). Prompt tokens and the first 8 greedy tokens match llama.cpp exactly; 1.9 tok/s on one core on Linux. The in-ZealOS boot (12 GB guest, weights split into 7 FAT32 parts) is in progress |
 
 ## How it works
 
@@ -79,11 +79,12 @@ The full walkthrough and the traps we hit are in [aipack/README.md](aipack/READM
 ## Roadmap
 
 1. Bake the AI layer into a rebuilt kernel (Syscall, agent scheduler on the timer ISR).
-2. Run Bonsai 2.5 27B in ring 0, which needs a second engine for the `qwen35` architecture (Gated DeltaNet plus gated attention, Hadamard-rotated `PQ2_0` ternary weights, 8.3 GB).
+2. Boot Bonsai 2.5 27B inside ZealOS, spread it across every core, and ship it as an `awzeal:bonsai` image variant.
 
 ## Credits and licences
 
 - ZealOS / TempleOS: public domain (Unlicense). See [LICENSE](LICENSE).
 - llm.asm: MIT, (c) alesha-pro. The engine sources are fetched at build time.
 - Qwen3-0.6B: Apache-2.0, Qwen team. The weights are downloaded at build time and never committed.
-- ZealOS-AI additions: Aitherium.
+- awzeal additions: Aitherium.
+- Ternary-Bonsai-2.5-27B: PrismML. The weights are not included.

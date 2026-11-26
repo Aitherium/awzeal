@@ -1,4 +1,4 @@
-# ZealOS-AI inference pack
+# awzeal inference pack
 
 ZealOS runs a real LLM in ring 0. Qwen3-0.6B (Q8_0) answers on the ZealOS console with no Linux, no host round-trip and no network. The tokens are computed by the guest CPU inside ZealOS.
 
@@ -45,4 +45,4 @@ bash aipack/host/z.sh run @aipack/steps/proof.txt
 
 - Use every core through ZealOS `JobQueue`: shard `matmul_q8_0_range` and `gqa_attn_range` across CPUs. This is single-core today.
 - Wire `AIAsk` into the fork's kernel `InferQueue` / `InferSync` so agents (`AgentSpawn`) infer locally.
-- Bonsai 2.5 27B (`qwen35`: Gated DeltaNet plus gated attention, Hadamard-rotated `PQ2_0` ternary weights, 8.3 GB) needs a second engine. llm.asm covers Qwen3 dense with Q8_0 only.
+- Bonsai 2.5 27B has its own engine in `bonsai/` (ENGINE2.BIN, same ABI); it is at parity with llama.cpp on Linux, and its in-guest boot is in progress.
