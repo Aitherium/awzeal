@@ -1,0 +1,14 @@
+.git
+build
+screenshots
+aipack/evidence
+aipack/bonsai
+tools
+zealbooter
+src/Apps
+src/Demo
+src/Doc
+src/Home
+src/Misc
+src/System
+src/Compiler

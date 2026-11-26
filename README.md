@@ -1,8 +1,8 @@
-# ZealOS-AI
+# awzeal
 
-ZealOS with an LLM running in ring 0. You boot it and the OS answers questions. There is no Linux under it, no host doing the work, and no network call. The tokens come from the CPU, inside ZealOS.
+A micro-OS with an LLM in ring 0, deployable as a container. awzeal is ZealOS with the model running inside the kernel. You boot it and the OS answers questions. There is no Linux under it, no host doing the work, and no network call. The tokens come from the CPU, inside ZealOS.
 
-![ZealOS-AI answering on the console](aipack/evidence/p3-answers.png)
+![awzeal answering on the console](aipack/evidence/p3-answers.png)
 
 Measured 2026-11-26 on QEMU KVM, Ryzen 9 9950X3D (single-core run shown; 4 cores do 25-32 tok/s):
 
@@ -14,7 +14,22 @@ The capital of Germany is Berlin.          <- follow-up turn, same KV cache
 ZLOUT-END prefill=20 tok 0.47s decode=7 tok 0.37s (18.96 tok/s) ctx=60/1024
 ```
 
-This is a fork of [ZealOS](https://github.com/Zeal-Operating-System/ZealOS), which is itself a modernized fork of TempleOS. The upstream README is kept in [UPSTREAM-README.md](UPSTREAM-README.md).
+awzeal is a fork of [ZealOS](https://github.com/Zeal-Operating-System/ZealOS), which is itself a modernized fork of TempleOS. The upstream README is kept in [UPSTREAM-README.md](UPSTREAM-README.md).
+
+## Run it
+
+```bash
+podman run -it --device /dev/kvm ghcr.io/aitherium/awzeal
+# or: docker run -it --device /dev/kvm ghcr.io/aitherium/awzeal
+```
+
+The container boots the awzeal ISO under QEMU/KVM and wires the guest's COM1 to your terminal. You get an `awzeal>` chat prompt. Every token is computed inside ZealOS. One-shot mode is for scripts:
+
+```bash
+podman run --rm --device /dev/kvm -e AWZEAL_PROMPT="Write one sentence about operating systems." ghcr.io/aitherium/awzeal
+```
+
+`AWZEAL_SMP` sets the cores (default: min(host, 8)) and `AWZEAL_RAM` the guest RAM (default `4G`). Without `/dev/kvm` it falls back to TCG, which works but is slow. Build it yourself with `podman build -f image/Containerfile -t awzeal .`
 
 ## What works today
 
@@ -24,9 +39,11 @@ This is a fork of [ZealOS](https://github.com/Zeal-Operating-System/ZealOS), whi
 | `AIAsk(prompt)` / `AIChat` from the ZealOS shell | **works** |
 | Boot-to-answer autostart from the live ISO | **works**: the autostart mounts the AI-pack SATA disk and runs it |
 | Answers mirrored to COM1 (`ZLOUT-BEGIN` / `ZLOUT-END`) | **works**: this is how CI and the host scripts verify a run |
+| Container image (`ghcr.io/aitherium/awzeal`) | **works**: boot to chat in one `podman run`; CI builds it, smoke-tests it under KVM and publishes it |
+| Spawned agents think locally (AgentForge -> AgentTick -> InferQueue) | **works**: `worker#0` answers through its own capability token |
 | Multi-core inference | **works**: workers pinned to every core; 4 cores reach 25-32 tok/s |
 | Agent inference through the kernel `InferQueue` | **works**: FluxIDT + CapEngine + InferQueue JIT-compile at boot (`AIKERNEL.ZC`); a capability-checked `InferSync` from agent 1 completes on the `LOCAL_CPU` backend |
-| AgentForge / Syscall (need a rebuilt kernel) | source is in `src/Kernel`; the full fork-kernel build is not proven yet. The performance table in [ZEALOS-AI.md](ZEALOS-AI.md) is a design target, not a measurement |
+| Syscall (INT 0x80 ring-3 gate; needs a rebuilt kernel) | source is in `src/Kernel`; the full fork-kernel build is not proven yet. The performance table in [ZEALOS-AI.md](ZEALOS-AI.md) is a design target, not a measurement |
 | Bonsai 2.5 27B (ternary, `qwen35` hybrid architecture) | planned: needs a second engine |
 
 ## How it works
@@ -45,7 +62,7 @@ ENGINE.BIN  ZlBegin -> ZlNext ... -> ZlEnd    x86-64 AVX2  (aipack/engine/zeal_g
 QWEN3.BIN  (.asmbin, 614 MiB, read from the FAT32 AI-pack disk)
 ```
 
-## Try it
+## Develop it
 
 You need a Linux host with KVM, podman and QEMU, and a CPU with AVX2 + FMA + F16C.
 
@@ -61,7 +78,7 @@ The full walkthrough and the traps we hit are in [aipack/README.md](aipack/READM
 
 ## Roadmap
 
-1. Spawn agents (AgentForge) on the same path once the fork kernel builds.
+1. Bake the AI layer into a rebuilt kernel (Syscall, agent scheduler on the timer ISR).
 2. Run Bonsai 2.5 27B in ring 0, which needs a second engine for the `qwen35` architecture (Gated DeltaNet plus gated attention, Hadamard-rotated `PQ2_0` ternary weights, 8.3 GB).
 
 ## Credits and licences

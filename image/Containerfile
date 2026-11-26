@@ -1,0 +1,51 @@
+# awzeal: a ring-0 LLM micro-OS you run as a container.
+#
+#   podman run -it --device /dev/kvm ghcr.io/aitherium/awzeal
+#
+# The container builds nothing at start: it boots the awzeal live ISO under
+# QEMU/KVM with the AI-pack disk (engine + Qwen3-0.6B) and wires the guest's
+# COM1 to your terminal. Inference runs inside ZealOS, in ring 0.
+#
+# Build (from the repo root):  podman build -f image/Containerfile -t awzeal .
+
+FROM docker.io/library/debian:12 AS build
+ARG LLMASM_REF=48feccbfd57cb669440f31ff64958d95bb8b848e
+ARG QWEN_REPO=Qwen/Qwen3-0.6B
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+      nasm binutils python3 python3-numpy curl git ca-certificates >/dev/null \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /w
+RUN git clone -q https://github.com/alesha-pro/llm.asm /w/llm.asm \
+ && git -C /w/llm.asm checkout -q "$LLMASM_REF"
+# Qwen3-0.6B -> .asmbin v2 (Q8_0, fp16 scales). Weights never enter git.
+RUN mkdir -p /w/qwen && cd /w/qwen \
+ && for f in config.json tokenizer.json tokenizer_config.json generation_config.json model.safetensors; do \
+      curl -sSfL --retry 3 -o "$f" "https://huggingface.co/$QWEN_REPO/resolve/main/$f"; done \
+ && python3 /w/llm.asm/scripts/export_weights.py --model-dir /w/qwen \
+      --out /w/QWEN3.BIN --scale-dtype fp16 \
+ && rm -rf /w/qwen
+COPY aipack /w/aipack
+COPY src/Kernel /w/src/Kernel
+RUN mkdir -p /out \
+ && bash /w/aipack/engine/build-native.sh /w/llm.asm /w/aipack /out \
+ && python3 /w/aipack/host/mkaikernel.py /w/src /out/AIKERNEL.ZC \
+ && cp /w/aipack/zealos/AILLM.ZC /w/aipack/zealos/AIINFER.ZC /w/aipack/zealos/RUN.ZC /out/ \
+ && mv /w/QWEN3.BIN /out/QWEN3.BIN
+# Upstream ZealOS live ISO (public domain), /Home/Once.ZC patched to autostart the AI pack.
+RUN url=$(curl -sSfL https://api.github.com/repos/Zeal-Operating-System/ZealOS/releases/latest \
+      | python3 -c "import json,sys; print([a['browser_download_url'] for a in json.load(sys.stdin)['assets'] if 'PublicDomain-BIOS' in a['name']][0])") \
+ && curl -sSfL --retry 3 -o /w/zealos.iso "$url" \
+ && python3 /w/aipack/host/patch_once.py /w/zealos.iso /out/awzeal-live.iso /w/aipack/zealos/ONCE-AUTOSTART.ZC
+
+FROM docker.io/library/debian:12-slim
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+      qemu-system-x86 python3 dosfstools mtools fdisk >/dev/null \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out /opt/awzeal
+COPY image/awzeal-run.py /opt/awzeal/awzeal-run.py
+LABEL org.opencontainers.image.title="awzeal" \
+      org.opencontainers.image.description="ZealOS with a ring-0 LLM (Qwen3-0.6B) - boots under KVM, chat on the console" \
+      org.opencontainers.image.source="https://github.com/Aitherium/awzeal" \
+      org.opencontainers.image.licenses="Unlicense AND MIT AND Apache-2.0"
+ENV AWZEAL_RAM=4G AWZEAL_SMP=0
+ENTRYPOINT ["python3", "-u", "/opt/awzeal/awzeal-run.py"]
