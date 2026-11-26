@@ -1,0 +1,264 @@
+// AITOOLS.ZC -- tool calling in the kernel. A port of our awkit tool-loop.ts:
+// the same Hermes contract (a <tools> block in the system turn, <tool_call>{json}</tool_call>
+// from the model, results handed back as <tool_response>), the same lenient parser
+// (trailing commas, single quotes, an unclosed call at end of text) and the same
+// MAX_TOOL_ROUNDS = 3. The tools are kernel functions; the model never runs code.
+//
+//   AIToolsInit;                       // registers the built-in kernel tools
+//   AIToolAsk("What time is it?");     // ask -> call tools -> answer, up to 3 rounds
+//
+// Needs AILLM.ZC (an engine with ZlSystem at header slot 10).
+
+#define AIT_MAX_TOOLS	16
+#define AIT_MAX_ROUNDS	3
+#define AIT_OUT_CAP		4096
+#define AIT_RES_CAP		1536
+
+class CAiTool
+{
+	U8	*name, *desc, *params;	// params = JSON-Schema object text
+	U0	(*fn)(U8 *args, U8 *res, I64 cap);
+};
+
+CAiTool	ait_tools[AIT_MAX_TOOLS];
+I64		ait_count = 0;
+I64		(*ZlSystem)(U8 *text);
+U8		ait_sys[8192];
+
+U0 AIToolAdd(U8 *name, U8 *desc, U8 *params, U0 (*fn)(U8 *args, U8 *res, I64 cap))
+{
+	if (ait_count >= AIT_MAX_TOOLS)
+		return;
+	ait_tools[ait_count].name	= name;
+	ait_tools[ait_count].desc	= desc;
+	ait_tools[ait_count].params	= params;
+	ait_tools[ait_count].fn		= fn;
+	ait_count++;
+}
+
+U0 AIToolsRender(U8 *out)
+{// Byte-compatible with renderToolsSystemBlock() in tool-loop.ts.
+	I64 i;
+	U8 *p = out;
+	StrCopy(p, "You may call functions to help answer the user.\n\n"
+			   "You are provided with function signatures within <tools></tools> XML tags:\n<tools>");
+	p += StrLen(p);
+	for (i = 0; i < ait_count; i++)
+	{
+		StrPrint(p, "\n{\"name\": \"%s\", \"description\": \"%s\", \"parameters\": %s}",
+				 ait_tools[i].name, ait_tools[i].desc, ait_tools[i].params);
+		p += StrLen(p);
+	}
+	StrCopy(p, "\n</tools>\n\nFor each function call, return a json object with function name and "
+			   "arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n"
+			   "{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>");
+}
+
+//--- minimal JSON readers (enough for {"name": "...", "arguments": {...}}) ---
+
+U8 *AitSkipWs(U8 *p)
+{
+	while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')
+		p++;
+	return p;
+}
+
+Bool AitJsonStr(U8 *json, U8 *key, U8 *out, I64 cap)
+{// Value of "key": "..." (or 'key': '...') anywhere in json, copied to out.
+	U8	*p = json, *k;
+	I64	 n, klen = StrLen(key);
+	U8	 q;
+	while (*p)
+	{
+		if ((*p == '"' || *p == '\'') && !MemCompare(p + 1, key, klen) && p[klen + 1] == *p)
+		{
+			k = AitSkipWs(p + klen + 2);
+			if (*k == ':')
+			{
+				k = AitSkipWs(k + 1);
+				if (*k == '"' || *k == '\'')
+				{
+					q = *k++;
+					n = 0;
+					while (*k && *k != q && n < cap - 1)
+					{
+						if (*k == '\\' && k[1])
+							k++;
+						out[n++] = *k++;
+					}
+					out[n] = 0;
+					return TRUE;
+				}
+			}
+		}
+		p++;
+	}
+	*out = 0;
+	return FALSE;
+}
+
+U8 *AitJsonObj(U8 *json, U8 *key)
+{// Start of the {...} value of "key" (arguments / parameters), or NULL.
+	U8 *p = json, *k;
+	I64 klen = StrLen(key);
+	while (*p)
+	{
+		if ((*p == '"' || *p == '\'') && !MemCompare(p + 1, key, klen) && p[klen + 1] == *p)
+		{
+			k = AitSkipWs(p + klen + 2);
+			if (*k == ':')
+			{
+				k = AitSkipWs(k + 1);
+				if (*k == '{')
+					return k;
+			}
+		}
+		p++;
+	}
+	return NULL;
+}
+
+//--- built-in kernel tools ---
+
+U0 AitToolTime(U8 *args, U8 *res, I64 cap)
+{
+	CDateStruct ds;
+	Date2Struct(&ds, Now);
+	StrPrint(res, "{\"date\": \"%04d-%02d-%02d\", \"time\": \"%02d:%02d:%02d\"}",
+			 ds.year, ds.mon, ds.day_of_mon, ds.hour, ds.min, ds.sec);
+}
+
+U0 AitToolListDir(U8 *args, U8 *res, I64 cap)
+{
+	U8			 path[256], mask[300], *p = res;
+	CDirEntry	*tmpde, *de;
+	I64			 n = 0;
+	if (!AitJsonStr(args, "path", path, 256) || !*path)
+		StrCopy(path, "C:/");
+	StrPrint(mask, "%s/*", path);
+	de = FilesFind(mask);
+	StrCopy(p, "{\"path\": \"");
+	StrCopy(p + StrLen(p), path);
+	StrCopy(p + StrLen(p), "\", \"entries\": [");
+	tmpde = de;
+	while (tmpde && StrLen(res) < cap - 80)
+	{
+		if (*tmpde->name != '.')
+		{
+			if (n++)
+				StrCopy(res + StrLen(res), ", ");
+			StrPrint(res + StrLen(res), "\"%s\"", tmpde->name);
+		}
+		tmpde = tmpde->next;
+	}
+	StrCopy(res + StrLen(res), "]}");
+	DirTreeDel(de);
+}
+
+U0 AitToolSystem(U8 *args, U8 *res, I64 cap)
+{
+	StrPrint(res, "{\"os\": \"awzeal (ZealOS) ring 0\", \"cores\": %d, \"llm_threads\": %d, "
+			 "\"ctx_used\": %d, \"ctx_max\": %d}", mp_count, zl.threads, (*ZlStat)(0), (*ZlStat)(1));
+}
+
+U0 AIToolsInit()
+{
+	ait_count = 0;
+	ZlSystem = zl.image + (zl.image(U32 *))[10];
+	AIToolAdd("get_time", "Get the current date and time from the kernel clock.",
+			  "{\"type\": \"object\", \"properties\": {}}", &AitToolTime);
+	AIToolAdd("list_dir", "List the files in a directory on a ZealOS drive, e.g. C:/.",
+			  "{\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}}, \"required\": [\"path\"]}",
+			  &AitToolListDir);
+	AIToolAdd("system_info", "Get information about this operating system: cores and LLM context.",
+			  "{\"type\": \"object\", \"properties\": {}}", &AitToolSystem);
+}
+
+//--- the loop ---
+
+I64 AitRun(U8 *call, U8 *res)
+{// Execute one parsed call body; returns the tool index or -1.
+	U8	 name[64], args_buf[1024], *args;
+	I64	 i, n;
+	if (!AitJsonStr(call, "name", name, 64))
+		return -1;
+	args = AitJsonObj(call, "arguments");
+	if (!args)
+		args = AitJsonObj(call, "parameters");
+	if (args)
+	{
+		n = StrLen(args);
+		if (n > 1023)
+			n = 1023;
+		MemCopy(args_buf, args, n);
+		args_buf[n] = 0;
+	}
+	else
+		StrCopy(args_buf, "{}");
+	for (i = 0; i < ait_count; i++)
+		if (!StrCompare(name, ait_tools[i].name))
+		{
+			(*ait_tools[i].fn)(args_buf, res, AIT_RES_CAP);
+			return i;
+		}
+	StrPrint(res, "{\"error\": \"unknown tool %s\"}", name);
+	return -1;
+}
+
+I64 AitHandleCalls(U8 *text, U8 *responses)
+{// Find every <tool_call>...</tool_call> (or an unclosed one at the end), run it,
+// append <tool_response> blocks. Returns the number of calls executed.
+	U8	*p = text, *body, *end, res[AIT_RES_CAP], msg[AIT_RES_CAP + 128];
+	I64	 calls = 0;
+	U8	 saved;
+	*responses = 0;
+	while (p = StrFind("<tool_call>", p))
+	{
+		body = p + 11;
+		end = StrFind("</tool_call>", body);
+		if (end)
+		{
+			saved = *end;
+			*end = 0;
+		}
+		*res = 0;
+		AitRun(body, res);
+		if (*res)
+		{
+			StrPrint(msg, "<tool_response>\n%s\n</tool_response>\n", res);
+			StrCopy(responses + StrLen(responses), msg);
+			ZlSerPut("[AITOOL] ");
+			ZlSerPut(body);
+			ZlSerPut(" -> ");
+			ZlSerPut(res);
+			ZlSerPut("\n");
+			calls++;
+		}
+		if (!end)
+			break;
+		*end = saved;
+		p = end + 12;
+	}
+	return calls;
+}
+
+I64 AIToolAsk(U8 *prompt)
+{// Fresh conversation: system turn with the tools, user turn, then tool rounds.
+	U8	*out = CAlloc(AIT_OUT_CAP), *resp = CAlloc(AIT_OUT_CAP);
+	I64	 round, calls = 0, n;
+	AIToolsRender(ait_sys);
+	(*ZlSystem)(ait_sys);
+	AIAsk(prompt, out, AIT_OUT_CAP);
+	for (round = 0; round < AIT_MAX_ROUNDS; round++)
+	{
+		n = AitHandleCalls(out, resp);
+		if (!n)
+			break;
+		calls += n;
+		*out = 0;
+		AIAsk(resp, out, AIT_OUT_CAP);
+	}
+	Free(out);
+	Free(resp);
+	return calls;
+}

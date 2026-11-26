@@ -20,6 +20,7 @@ extern g_ctx
 extern model_init
 extern transformer_forward
 extern tok_build_chat_prompt
+extern tok_encode_bpe
 extern argmax_f32
 extern matmul_q8_0_range
 extern gqa_attn_range
@@ -52,6 +53,7 @@ zl_header:
     dd zl_stat  - zl_header         ; +28  I64 ZlStat(I64 which)
     dd zl_worker - zl_header        ; +32  I64 ZlWorker(I64 tid)   run jobs on this core; returns after ~20 ms idle
     dd zl_threads - zl_header       ; +36  I64 ZlThreads(I64 n)    n = BSP + workers (1 = single core)
+    dd zl_system - zl_header        ; +40  I64 ZlSystem(U8 *text)  prefill a system turn (tools block) -> ctx pos
     times 64 - ($ - zl_header) db 0
 
 %macro HC_ENTER 0
@@ -296,6 +298,54 @@ zl_stat:
     je      .r
     mov     rax, [rel zl_n_gen]
 .r:
+    HC_LEAVE 8
+
+; I64 ZlSystem(U8 *text) -- start a fresh conversation with a system turn:
+;   <|im_start|>system\n{text}<|im_end|>\n   prefilled into the KV cache (no output).
+; The Hermes tool contract lives in this turn; later ZlBegin turns continue after it.
+zl_system:
+    HC_ENTER
+    lea     rbx, [rel g_ctx]
+    mov     r14, [rbx + CTX_BUF_PROMPT]
+    mov     dword [r14], TOK_IM_START
+    lea     rdi, [rel zl_s_system]
+    call    str_len
+    mov     rsi, rax
+    lea     rdi, [rel zl_s_system]
+    lea     rdx, [r14 + 4]
+    mov     rcx, 16
+    call    tok_encode_bpe
+    lea     r12, [rax + 1]              ; tokens so far
+    mov     rdi, HC_ARG(1)
+    call    str_len
+    mov     rsi, rax
+    mov     rdi, HC_ARG(1)
+    lea     rdx, [r14 + r12*4]
+    mov     rcx, MAX_PROMPT_TOKENS - 8
+    sub     rcx, r12
+    call    tok_encode_bpe
+    add     r12, rax
+    mov     dword [r14 + r12*4], TOK_IM_END
+    mov     dword [r14 + r12*4 + 4], TOK_NL
+    add     r12, 2
+    xor     r13d, r13d                  ; a system turn always starts the conversation
+    xor     r15d, r15d
+.sp:
+    cmp     r15, r12
+    jae     .sp_done
+    cmp     r13, [rbx + CTX_MAX_SEQ]
+    jae     .sp_done
+    mov     edi, [r14 + r15*4]
+    mov     rsi, r13
+    xor     edx, edx                    ; no logits needed
+    call    transformer_forward
+    inc     r15
+    inc     r13
+    jmp     .sp
+.sp_done:
+    mov     [rel zl_chat_pos], r13
+    mov     [rel zl_pos], r13
+    mov     rax, r13
     HC_LEAVE 8
 
 ; I64 ZlThreads(I64 n) -- cores used per matmul/attention (BSP + n-1 workers)
@@ -597,6 +647,7 @@ tp_gqa_attn:
 section .rodata
 align 4
 zl_mxcsr_default: dd 0x1F80
+zl_s_system:      db "system", 10, 0
 
 section .bss
 alignb 64

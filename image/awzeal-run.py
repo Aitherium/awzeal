@@ -19,7 +19,7 @@ import time
 
 HOME = os.environ.get("AWZEAL_HOME", "/opt/awzeal")
 RUN = "/tmp/awzeal"
-PACK_FILES = ["ENGINE.BIN", "QWEN3.BIN", "AILLM.ZC", "AIKERNEL.ZC", "AIINFER.ZC", "RUN.ZC"]
+PACK_FILES = ["ENGINE.BIN", "QWEN3.BIN", "AILLM.ZC", "AIKERNEL.ZC", "AIINFER.ZC", "AITOOLS.ZC", "RUN.ZC"]
 
 
 def log(msg: str) -> None:

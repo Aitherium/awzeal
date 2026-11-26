@@ -4,6 +4,7 @@
 #include "AIKERNEL.ZC"
 #include "AILLM.ZC"
 #include "AIINFER.ZC"
+#include "AITOOLS.ZC"
 
 U0 ZlRunProof()
 {
@@ -21,6 +22,13 @@ U0 ZlRunProof()
 			ZlLog("[AIAGENT] PASS\n");
 		else
 			ZlLog("[AIAGENT] FAIL\n");
+		AIToolsInit;
+		if (AIToolAsk("What is the date and time right now?") +
+			AIToolAsk("Which files are on drive C:/ ?") > 0)
+			ZlLog("[AITOOLS] PASS\n");
+		else
+			ZlLog("[AITOOLS] FAIL: the model made no tool call\n");
+		(*ZlReset)();
 	}
 	ZlSerPut("ZLRUN-DONE\n");
 }

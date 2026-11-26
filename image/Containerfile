@@ -29,7 +29,7 @@ COPY src/Kernel /w/src/Kernel
 RUN mkdir -p /out \
  && bash /w/aipack/engine/build-native.sh /w/llm.asm /w/aipack /out \
  && python3 /w/aipack/host/mkaikernel.py /w/src /out/AIKERNEL.ZC \
- && cp /w/aipack/zealos/AILLM.ZC /w/aipack/zealos/AIINFER.ZC /w/aipack/zealos/RUN.ZC /out/ \
+ && cp /w/aipack/zealos/AILLM.ZC /w/aipack/zealos/AIINFER.ZC /w/aipack/zealos/AITOOLS.ZC /w/aipack/zealos/RUN.ZC /out/ \
  && mv /w/QWEN3.BIN /out/QWEN3.BIN
 # Upstream ZealOS live ISO (public domain), /Home/Once.ZC patched to autostart the AI pack.
 RUN url=$(curl -sSfL https://api.github.com/repos/Zeal-Operating-System/ZealOS/releases/latest \
