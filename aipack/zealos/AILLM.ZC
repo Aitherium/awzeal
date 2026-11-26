@@ -1,0 +1,247 @@
+// AILLM.ZC -- ring-0 local LLM for ZealOS-AI.
+// Loads ENGINE.BIN (llm.asm Qwen3 engine, pure x86-64 AVX2) and a .asmbin
+// model from disk, then runs inference in the calling task. No network, no
+// host: the tokens are computed by this machine's CPU inside ZealOS.
+//
+//   #include "AILLM";
+//   AILLMLoad("D:/ENGINE.BIN", "D:/QWEN3.BIN");
+//   AIAsk("What is the capital of France?");
+//   AIChat;            // interactive, /reset /think /nothink /quit
+//
+// Every answer is mirrored to COM1 between ZLOUT markers so a host can verify it.
+
+#define ZL_COM1			0x3F8
+#define ZL_CTX			1024
+#define ZL_ARENA_MB		448
+
+class CZlEngine
+{
+	U8		*image, *model, *arena;
+	I64		 image_size, model_size, arena_size;
+	Bool	 ready, think;
+	I64		 lock;
+};
+
+CZlEngine zl;
+I64 (*ZlInit)(U8 *model, I64 size, U8 *arena, I64 arena_size, I64 ctx);
+I64 (*ZlBegin)(U8 *prompt, I64 think);
+I64 (*ZlNext)(U8 *buf, I64 cap);
+I64 (*ZlEnd)();
+I64 (*ZlReset)();
+I64 (*ZlStat)(I64 which);
+
+U0 ZlSerInit()
+{
+	OutU8(ZL_COM1 + 1, 0x00);
+	OutU8(ZL_COM1 + 3, 0x80);
+	OutU8(ZL_COM1 + 0, 0x01);
+	OutU8(ZL_COM1 + 1, 0x00);
+	OutU8(ZL_COM1 + 3, 0x03);
+	OutU8(ZL_COM1 + 2, 0xC7);
+	OutU8(ZL_COM1 + 4, 0x0B);
+}
+
+U0 ZlSerPut(U8 *s)
+{
+	I64 spin;
+	while (*s)
+	{
+		spin = 0;
+		while (!(InU8(ZL_COM1 + 5) & 0x20) && spin < 100000)
+			spin++;
+		OutU8(ZL_COM1, *s);
+		s++;
+	}
+}
+
+U0 ZlLog(U8 *s)
+{
+	ZlSerPut(s);
+	"%s", s;
+}
+
+U8 *ZlReadAligned(U8 *name, I64 *_size)
+{// Whole file into a 4 KiB aligned buffer owned by sys_task (outlives this task).
+	CFile	*f;
+	I64		 size, blks, b, n, last_mb;
+	U8		*buf, msg[128];
+
+	f = FOpen(name, "r");
+	if (!f)
+	{
+		StrPrint(msg, "[AILLM] cannot open %s\n", name);
+		ZlLog(msg);
+		return NULL;
+	}
+	size = f->de.size;
+	blks = (size + BLK_SIZE - 1) / BLK_SIZE;
+	buf = MAllocAligned(blks * BLK_SIZE + BLK_SIZE, 4096, sys_task);
+	if (!buf)
+	{
+		FClose(f);
+		ZlLog("[AILLM] out of memory reading file\n");
+		return NULL;
+	}
+	b = 0;
+	last_mb = 0;
+	while (b < blks)
+	{
+		n = blks - b;
+		if (n > 2048)
+			n = 2048;
+		FBlkRead(f, buf + b * BLK_SIZE, b, n);
+		b += n;
+		if ((b * BLK_SIZE) >> 26 != last_mb)
+		{
+			last_mb = (b * BLK_SIZE) >> 26;
+			StrPrint(msg, "[AILLM] %s: %d MiB\n", name, (b * BLK_SIZE) >> 20);
+			ZlLog(msg);
+			Yield;
+		}
+	}
+	FClose(f);
+	*_size = size;
+	return buf;
+}
+
+Bool AILLMLoad(U8 *engine_path="ENGINE.BIN", U8 *model_path="QWEN3.BIN")
+{
+	U8	*file, msg[256];
+	I64	 fsize, img, res;
+	F64	 t0;
+
+	ZlSerInit;
+	ZlLog("[AILLM] loading engine\n");
+	t0 = tS;
+	file = FileRead(engine_path, &fsize);
+	if (!file || fsize < 80 || MemCompare(file, "ZENG", 4))
+	{
+		ZlLog("[AILLM] ENGINE.BIN missing or bad magic\n");
+		return FALSE;
+	}
+	img = (file(U32 *))[1];
+	if ((file(U32 *))[2] || (file(U32 *))[3])
+	{// The engine is built RIP-relative; a relocation would mean the build changed.
+		ZlLog("[AILLM] ENGINE.BIN carries relocations; this loader does not apply them\n");
+		Free(file);
+		return FALSE;
+	}
+	zl.image = MAllocAligned(img, 4096, sys_task);
+	MemCopy(zl.image, file + 64, img);
+	zl.image_size = img;
+	Free(file);
+	if (MemCompare(zl.image, "ZLE1", 4))
+	{
+		ZlLog("[AILLM] engine image header not ZLE1\n");
+		return FALSE;
+	}
+	ZlInit	= zl.image + (zl.image(U32 *))[2];
+	ZlBegin	= zl.image + (zl.image(U32 *))[3];
+	ZlNext	= zl.image + (zl.image(U32 *))[4];
+	ZlEnd	= zl.image + (zl.image(U32 *))[5];
+	ZlReset	= zl.image + (zl.image(U32 *))[6];
+	ZlStat	= zl.image + (zl.image(U32 *))[7];
+
+	zl.model = ZlReadAligned(model_path, &zl.model_size);
+	if (!zl.model)
+		return FALSE;
+	zl.arena_size = ZL_ARENA_MB << 20;
+	zl.arena = MAllocAligned(zl.arena_size, 4096, sys_task);
+	if (!zl.arena)
+	{
+		ZlLog("[AILLM] cannot allocate the KV arena\n");
+		return FALSE;
+	}
+	res = (*ZlInit)(zl.model, zl.model_size, zl.arena, zl.arena_size, ZL_CTX);
+	if (res < 0)
+	{
+		StrPrint(msg, "[AILLM] model_init failed: %d\n", res);
+		ZlLog(msg);
+		return FALSE;
+	}
+	zl.ready = TRUE;
+	StrPrint(msg, "[AILLM] ready: engine %d B, model %d MiB, ctx %d, vocab %d, load %0.2fs\n",
+			 zl.image_size, zl.model_size >> 20, (*ZlStat)(1), (*ZlStat)(3), tS - t0);
+	ZlLog(msg);
+	return TRUE;
+}
+
+I64 AIAsk(U8 *prompt, U8 *out=NULL, I64 out_cap=0, Bool echo=TRUE)
+{// One assistant turn in the running conversation. Returns tokens generated.
+	U8	 tok[256], msg[256];
+	I64	 n, n_prompt, n_gen = 0, used = 0;
+	F64	 t0, t1, t2;
+
+	if (!zl.ready)
+	{
+		"AILLM not loaded: run AILLMLoad first.\n";
+		return -1;
+	}
+	while (LBts(&zl.lock, 0))
+		Yield;
+	t0 = tS;
+	ZlSerPut("ZLOUT-BEGIN\n");
+	n_prompt = (*ZlBegin)(prompt, zl.think);
+	t1 = tS;
+	while (TRUE)
+	{
+		n = (*ZlNext)(tok, 255);
+		if (n < 0)
+			break;
+		tok[n] = 0;
+		n_gen++;
+		ZlSerPut(tok);
+		if (echo)
+			"%s", tok;
+		if (out && used + n < out_cap)
+		{
+			MemCopy(out + used, tok, n);
+			used += n;
+			out[used] = 0;
+		}
+		if (!(n_gen & 7))
+			Yield;
+	}
+	(*ZlEnd)();
+	t2 = tS;
+	StrPrint(msg, "\nZLOUT-END prefill=%d tok %0.2fs decode=%d tok %0.2fs (%0.2f tok/s) ctx=%d/%d\n",
+			 n_prompt, t1 - t0, n_gen, t2 - t1, n_gen / (t2 - t1 + 0.0001), (*ZlStat)(0), (*ZlStat)(1));
+	ZlSerPut(msg);
+	if (echo)
+		"%s", msg;
+	LBtr(&zl.lock, 0);
+	return n_gen;
+}
+
+U0 AIChat()
+{
+	U8 *line;
+
+	"$$GREEN$$ZealOS-AI local LLM (Qwen3-0.6B, ring 0). /reset /think /nothink /quit$$FG$$\n";
+	while (TRUE)
+	{
+		line = StrGet("$$CYAN$$you>$$FG$$ ");
+		if (!line)
+			break;
+		if (!StrCompare(line, "/quit"))
+		{
+			Free(line);
+			break;
+		}
+		else if (!StrCompare(line, "/reset"))
+		{
+			(*ZlReset)();
+			"[context cleared]\n";
+		}
+		else if (!StrCompare(line, "/think"))
+			zl.think = TRUE;
+		else if (!StrCompare(line, "/nothink"))
+			zl.think = FALSE;
+		else if (*line)
+		{
+			"$$YELLOW$$ai>$$FG$$ ";
+			AIAsk(line);
+		}
+		Free(line);
+	}
+}

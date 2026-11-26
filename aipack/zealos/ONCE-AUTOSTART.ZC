@@ -1,0 +1,44 @@
+//ZealOS-AI live autostart: mount SATA disks, run RUN.ZC from the AI pack.
+U0 ZAiSer(U8 *s)
+{
+while (*s) OutU8(0x3F8, *s++);
+}
+U0 ZAiAutostart()
+{
+I64 i;
+Bool hit;
+U8 path[32];
+CBlkDev *bd;
+ZAiSer("ZAI autostart\n");
+OnceExe;
+for (i = 0; i < AHCI_MAX_PORTS; i++)
+if (PCIBt(&blkdev.ahci_hba->ports_implemented, i) &&
+	blkdev.ahci_hba->ports[i].signature == AHCI_PxSIG_ATA)
+{
+ZAiSer("ZAI mount ATA\n");
+bd = BlkDevNextFreeSlot('C', BDT_ATA);
+bd->port_num = i;
+bd->ahci_port = &blkdev.ahci_hba->ports[i];
+bd->ahci_port->cmd_list_base = NULL;
+BlkDevAdd(bd,, FALSE, FALSE);
+}
+for (i = 'A'; i <= 'Z'; i++)
+{
+StrPrint(path, "%c:/RUN.ZC", i);
+hit = FALSE;
+try {hit = FileFind(path);}
+catch {Fs->catch_except = TRUE;}
+if (hit)
+{
+ZAiSer(path);
+ZAiSer(" found\n");
+StrPrint(path, "%c:/", i);
+Cd(path);
+ExeFile("RUN.ZC");
+return;
+}
+}
+ZAiSer("ZAI pack disk not found\n");
+DriveRep;
+}
+ZAiAutostart;

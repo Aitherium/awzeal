@@ -1,0 +1,8 @@
+wait:50
+mon:info status
+mon:sendkey n
+mon:info mice
+wait:3
+mon:sendkey ret
+wait:3
+shot:s4-keytest

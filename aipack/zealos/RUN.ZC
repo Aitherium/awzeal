@@ -1,0 +1,14 @@
+// RUN.ZC -- boot-time proof: load the engine + model, answer two turns of one
+// conversation, report on COM1. Runs from the AI pack drive (the autostart Cd()s there).
+#include "AILLM.ZC"
+
+U0 ZlRunProof()
+{
+	if (AILLMLoad("ENGINE.BIN", "QWEN3.BIN"))
+	{
+		AIAsk("What is the capital of France? Answer in one sentence.");
+		AIAsk("And what is the capital of Germany?");
+	}
+	ZlSerPut("ZLRUN-DONE\n");
+}
+ZlRunProof;

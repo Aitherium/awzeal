@@ -1,0 +1,8 @@
+wait:35
+key:spc
+wait:12
+type:n
+wait:4
+type:DriveRep;\n
+wait:5
+shot:s5-drives
