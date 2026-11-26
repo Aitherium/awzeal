@@ -40,42 +40,63 @@ BHD_GET_RIP:
 				DU8 		0xEA; 	//JMP BOOT_HIGH_LOC_HD:BHD_HISTART
 				DU16		BHD_HISTART - BHD_START, BOOT_HIGH_LOC_HD;
 
-BHD_BIOS_DRIVE_NUM:	DU8 0;
 
-//Gets patched by $LK,"BootHDIns",A="MN:BootHDIns"$().
 BHD_BLK_COUNT::	DU16		0;
 
-BHD_DAP:		DU8 		16, 0, 1, 0; //One block at a time
-BHD_DAP_BUF:	DU16		0, 0;
-//Gets patched by $LK,"BootHDIns",A="MN:BootHDIns"$().
-BHD_DAP_BLK:: 	//64-bit
 BHD_DAP_BLK_LO: DU32		0;
-BHD_DAP_BLK_HI: DU32		0;
 
 BHD_HISTART:
-				MOV 		U8 [BHD_BIOS_DRIVE_NUM - BHD_START], DL //Passed in by BIOS
 				MOV 		AX,  BOOT_RAM_BASE / 16
 				MOV 		ES,  AX
 				XOR 		ECX, ECX
 				MOV 		CX,  U16 [BHD_BLK_COUNT - BHD_START]
+				MOV 		EBX, U32 [BHD_DAP_BLK_LO - BHD_START]
 
 @@05:			PUSH		CX			//Block count
 
-//READ BLOCK
+//READ BLOCK - raw ATA PIO
 				PUSH		ES			//Buf seg
-				MOV 		AX, ES
-				MOV 		U16 [BHD_DAP_BUF + 2 - BHD_START], AX //ES:0000
-				MOV 		SI, BHD_DAP - BHD_START //DS:SI=DAP
-				MOV 		AH, 0x42
-				MOV 		DL, U8 [BHD_BIOS_DRIVE_NUM - BHD_START]
-				INT 		0x13
-
+				XOR 		DI, DI
+@@01:			MOV 		DX, 0x1F7
+				IN 			AL, DX
+				TEST 		AL, 0x80
+				JNZ 		@@01
+				MOV 		DX, 0x1F2
+				MOV 		AL, 1
+				OUT 		DX, AL
+				MOV 		DX, 0x1F3
+				MOV 		AL, BL
+				OUT 		DX, AL
+				MOV 		DX, 0x1F4
+				MOV 		AL, BH
+				OUT 		DX, AL
+				MOV 		DX, 0x1F5
+				SHR 		EBX, 16
+				MOV 		AL, BL
+				OUT 		DX, AL
+				MOV 		DX, 0x1F6
+				MOV 		AL, BH
+				AND 		AL, 0x0F
+				OR 			AL, 0xE0
+				OUT 		DX, AL
+				MOV 		DX, 0x1F7
+				MOV 		AL, 0x20
+				OUT 		DX, AL
+@@02:			IN 			AL, DX
+				TEST 		AL, 0x80
+				JNZ 		@@02
+				TEST 		AL, 0x01
+				JNZ 		@@03
+				TEST 		AL, 0x08
+				JZ 			@@02
+				MOV 		CX, 256
+				MOV 		DX, 0x1F0
+				DU8 		0xF3, 0x6D //REP INSW
+@@03:
 				POP 		AX			//ES
 				ADD 		AX, BLK_SIZE / 16
 				MOV 		ES, AX
-				INC 		U32 [BHD_DAP_BLK_LO - BHD_START]
-				JNZ 		@@10
-				INC 		U32 [BHD_DAP_BLK_HI - BHD_START]
+				INC 		EBX
 
 @@10:			POP 		CX
 				LOOP		@@05

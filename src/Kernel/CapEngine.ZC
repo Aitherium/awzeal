@@ -202,10 +202,15 @@ U0 CapAuditDump(I64 count=10)
 	for (i = 0; i < count; i++)
 	{
 		idx = (cap_engine.audit_head - count + i + CAP_MAX_AUDIT_LOG) % CAP_MAX_AUDIT_LOG;
+		U8 *audit_res_st;
+		if (cap_engine.audit_log[idx].result == CAP_AUDIT_ALLOW)
+			audit_res_st = "ALLOW";
+		else
+			audit_res_st = "DENY";
 		"  agent=%d resource='%s' action=0x%02X result=%s\n",
 			cap_engine.audit_log[idx].agent_id,
 			cap_engine.audit_log[idx].resource,
 			cap_engine.audit_log[idx].action,
-			cap_engine.audit_log[idx].result == CAP_AUDIT_ALLOW ? "ALLOW" : "DENY";
+			audit_res_st;
 	}
 }

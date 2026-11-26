@@ -48,9 +48,9 @@ extern class CAgentMeta; //ZealOS-AI: forward declaration for CTask.agent_meta
 #define F64_MAX 	(0x7FEFFFFFFFFFFFFF(F64))
 #define F64_MIN 	(0xFFEFFFFFFFFFFFFF(F64))
 #define inf 		(0x7FF0000000000000(F64))
-#define ∩┐╜ 			(0x7FF0000000000000(F64))
+#define infinity 			(0x7FF0000000000000(F64))
 #define pi			(0x400921FB54442D18(F64))
-#define ∩┐╜ 			(0x400921FB54442D18(F64))
+#define pi 			(0x400921FB54442D18(F64))
 #define exp_1 		(0x4005BF0A8B145769(F64)) //The number "e"
 #define log2_10 	(0x400A934F0979A371(F64))
 #define log2_e		(0x3FF71547652B82FE(F64))
@@ -544,7 +544,7 @@ class CVideoInfo
 };
 
 #define ZEALBOOTER_LIMINE_SIGNATURE_1	0xaa23c08ed10bd4d7; // See $LK+PU,"CORE0_32BIT_INIT",A="FF:::/Kernel/KStart32.ZC,JMP @@"$
-#define ZEALBOOTER_LIMINE_SIGNATURE_2	0xf6ceba7d4b74179a; //
+#define ZEALBOOTER_LIMINE_SIGNATURE_2	0xf6ceba7d4b74179a; 
 
 #help_index "Boot"
 class CKernel
@@ -1696,7 +1696,7 @@ public class CAutoCompleteDictGlobals
 #define OPTf_KEEP_PRIVATE 			7
 #define OPTf_NO_REG_VAR 			8	//Applied to functions, not statements
 #define OPTf_GLOBALS_ON_DATA_HEAP 	9
-//Disable 10-byte float consts for ∩┐╜,log2_10,log10_2,loge_2
+//Disable 10-byte float consts for ╧Ç,log2_10,log10_2,loge_2
 #define OPTf_NO_BUILTIN_CONST 		10	//Applied to functions, not statements
 #define OPTf_USE_IMM64				11	//Not completely implemented
 #define OPTf_DECIMAL_ONLY			12	//Only allow decimal numbers (no 0x or 0b prefixed numbers)
@@ -2709,7 +2709,7 @@ class CPCIDev
 //Physical Region Descriptor Table
 #define AHCI_PRD_MAX_BYTES		(4 * 1024 * 1024) //Max bytes that can go in one PRD entry ($ER$4 MiB). Section 4.2.3.3 Fig. 17 (DBC) 
 #define AHCI_PRDT_MAX_BLOCKS	(U16_MAX + 1) 	  //Max blocks you can transfer in one command. 
-#define AHCI_PRDT_MAX_LEN		8 				  //Max PRD entries in one command. This is equal to (MAX_BLOCKS * BLK_SIZE) ∩┐╜ MAX_BYTES.
+#define AHCI_PRDT_MAX_LEN		8 				  //Max PRD entries in one command. This is equal to (MAX_BLOCKS * BLK_SIZE) ≈ MAX_BYTES.
 
 //Global Host Control (Controller) flags
 #define AHCI_GHCf_HBA_RESET			0

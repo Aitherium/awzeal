@@ -78,15 +78,15 @@ U0 SysGrInit()
 
 	//patch some chars
 	text.aux_font[10]	= text.font[10]; //"Return" symbol 
-	text.aux_font[255]	= text.font[255]; //Block symbol ∩┐╜
+	text.aux_font[255]	= text.font[255]; //Block symbol Γûê
 
-	for (i = '∩┐╜'; i < '∩┐╜'; i++)
+	for (i = 0xB3; i < 0xDB; i++)
 		text.aux_font[i] = text.font[i];
 
-	text.aux_font['∩┐╜'] = text.font['∩┐╜'];
+	text.aux_font[0x1A] = text.font[0x1A];
 	
-	text.border_chars[2] (I64) = '∩┐╜═│∩┐╜∩┐╜╔┐∩┐╜';
-	text.border_chars[10](U32) = '∩┐╜∩┐╜┘╝';
+	text.border_chars[2] (I64) = '─═│║┌╔┐╗';
+	text.border_chars[10](U32) = '└╚┘╝';
 
 	text.cols = sys_framebuffer_width  / FONT_WIDTH;
 	text.rows = sys_framebuffer_height / FONT_HEIGHT;
@@ -265,7 +265,7 @@ U0 KMain()
 	if (n_gpus > 0)
 		"AIInit: %d GPU(s) detected\n", n_gpus;
 	else
-		"AIInit: No GPU ΓÇö network offload or CPU inference\n";
+		"AIInit: No GPU -- network offload or CPU inference\n";
 
 	//Initialize kernel state
 	MemSet(&kernel_state, 0, sizeof(CKernelState));

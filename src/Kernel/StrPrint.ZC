@@ -658,7 +658,7 @@ sp_out_inf:
 						if (flags & PRINTF_NEG)
 							SPutChar(_dst, '-', _buf);
 						for (i = 0; i < k; i++)
-							SPutChar(_dst, '∞', _buf);
+							SPutChar(_dst, '\xEC', _buf);
 						break;
 					}
 

@@ -15,6 +15,13 @@ I64 demo_work_counter = 0;
 I64 demo_monitor_counter = 0;
 I64 demo_events_received = 0;
 
+U8 *PassFail(Bool ok, U8 *pass_st, U8 *fail_st)
+{//ZealC has no ternary operator - demo print helper.
+	if (ok)
+		return pass_st;
+	return fail_st;
+}
+
 U0 DemoWorkAction(U8 *data)
 {//Worker task: increment counter and report.
 	no_warn data;
@@ -100,26 +107,26 @@ U0 AgentDemo()
 	//Worker (agent_id=1) should have tool.* execute
 	result = CapCheck(1, "tool.shell.exec", CAPa_EXECUTE);
 	"  Worker tool.shell.exec EXECUTE: %s\n",
-		result ? "ALLOW (PASS)" : "DENY (FAIL)";
+		PassFail(result, "ALLOW (PASS)", "DENY (FAIL)");
 
 	//Worker should NOT have agent.* spawn
 	result = CapCheck(1, "agent.new", CAPa_SPAWN);
 	"  Worker agent.new SPAWN: %s\n",
-		result ? "ALLOW (FAIL)" : "DENY (PASS)";
+		PassFail(result, "ALLOW (FAIL)", "DENY (PASS)");
 
 	//Monitor (agent_id=2) should have read-only
 	result = CapCheck(2, "agent.status", CAPa_READ);
 	"  Monitor agent.status READ: %s\n",
-		result ? "ALLOW (PASS)" : "DENY (FAIL)";
+		PassFail(result, "ALLOW (PASS)", "DENY (FAIL)");
 
 	result = CapCheck(2, "tool.shell.exec", CAPa_EXECUTE);
 	"  Monitor tool.shell.exec EXECUTE: %s\n",
-		result ? "ALLOW (FAIL)" : "DENY (PASS)";
+		PassFail(result, "ALLOW (FAIL)", "DENY (PASS)");
 
 	//Unregistered agent should be denied everything
 	result = CapCheck(99, "anything", CAPa_READ);
 	"  Unknown agent READ: %s\n\n",
-		result ? "ALLOW (FAIL)" : "DENY (PASS)";
+		PassFail(result, "ALLOW (FAIL)", "DENY (PASS)");
 
 	CapAuditDump(5);
 	"\n";
@@ -134,12 +141,12 @@ U0 AgentDemo()
 	//Depth 0 -> should succeed
 	session = ForgeDispatch(&spec, 0);
 	"  ForgeDispatch depth=0: %s\n",
-		session ? "OK (PASS)" : "FAILED (FAIL)";
+		PassFail(session, "OK (PASS)", "FAILED (FAIL)");
 
 	//Depth 3 -> should be rejected (FORGE_MAX_DEPTH=3)
 	session = ForgeDispatch(&spec, 3);
 	"  ForgeDispatch depth=3: %s\n\n",
-		session ? "SPAWNED (FAIL)" : "REJECTED (PASS)";
+		PassFail(session, "SPAWNED (FAIL)", "REJECTED (PASS)");
 
 	//--- Test 6: SlotPool ---
 	"[TEST 6] SlotPool Resource Semaphores\n";
@@ -152,7 +159,7 @@ U0 AgentDemo()
 
 	result = SlotAcquire(SLOT_TYPE_CPU, 1);
 	"  SlotAcquire CPU (worker): %s  used=%d/%d\n",
-		result ? "OK" : "DENIED",
+		PassFail(result, "OK", "DENIED"),
 		kernel_state.slots.used[SLOT_TYPE_CPU],
 		kernel_state.slots.total[SLOT_TYPE_CPU];
 
@@ -170,8 +177,8 @@ U0 AgentDemo()
 	AgentTick;
 	"  System pain after tick: %.2f\n", kernel_state.system_pain;
 	"  Monitor healing flag: %s\n\n",
-		Bt(&kernel_state.agents[2]->agent_flags, AGENTf_HEALING) ?
-		"SET (PASS)" : "NOT SET (FAIL)";
+		PassFail(Bt(&kernel_state.agents[2]->agent_flags, AGENTf_HEALING),
+				 "SET (PASS)", "NOT SET (FAIL)");
 
 	//--- Summary ---
 	"============================================\n";

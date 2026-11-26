@@ -19,12 +19,12 @@ U0 TXTPutS(CDoc *doc, U8 *st, I64 *_col)
 				break;
 
 			start:
-				case 'π':	ptr = "pi"; 	break;
-				case 'Θ':	ptr = "theta";	break;
-				case 'Φ':	ptr = "phi";	break;
-				case 'Ω':	ptr = "omega";	break;
-				case '∞':	ptr = "inf";	break;
-				case 'µ':	ptr = "u";		break;
+				case '\xE3':	ptr = "pi"; 	break;
+				case '\xE9':	ptr = "theta";	break;
+				case '\xE8':	ptr = "phi";	break;
+				case '\xEA':	ptr = "omega";	break;
+				case '\xEC':	ptr = "inf";	break;
+				case '\xE6':	ptr = "u";		break;
 			end:
 				DocPrint(doc, ptr);
 				*_col = *_col + StrLen(ptr);

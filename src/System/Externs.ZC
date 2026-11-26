@@ -89,3 +89,28 @@ extern U0	WinScrollsInit(CTask *task);
 extern I64	WinToTop(CTask *task=NULL, Bool update_z_buf=TRUE);
 extern Bool WinVert(I64 top, I64 bottom, CTask *task=NULL);
 extern CWinMgrGlobals winmgr;
+
+//--- ZealOS-AI: Kernel AI layer externs (defined in src/Kernel/*.ZC) ---
+//The kernel compiles before the System tree, but ZealC has no
+//cross-file symbol table -- every System file needs these declared.
+//Externs.ZC is the FIRST file MakeSystem compiles, so the kernel types
+//(CKernelState etc.) must be loaded here, not inherited from Math.
+#include "/Kernel/KernelA.HH"
+extern CKernelState kernel_state;
+extern CFluxVector	flux_vectors[FLUX_MAX_VECTORS];
+extern CCapEngine	cap_engine;
+extern Bool	FluxEmit(I64 vector, I64 event_type, I64 source_agent,
+				  U8 *payload, I64 payload_len);
+extern Bool	FluxSubscribe(I64 vector, U0 (*handler_fn)(CFluxEvent *event),
+					   I64 agent_id=0);
+extern U0	FluxDump(I64 vector);
+extern Bool	AgentTaskAdd(I64 agent_id, I64 effort, I64 interval,
+					  U0 (*action)(U8 *data), U8 *data=NULL, I64 goal_id=0);
+extern U0	AgentTick();
+extern U0	AgentListDump();
+extern Bool	CapCheck(I64 agent_id, U8 *resource, I64 action);
+extern Bool	CapTokenGrant(CCapToken *token, U8 *resource, I64 action_mask);
+extern U0	CapAuditDump(I64 count=10);
+extern CForgeSession *ForgeDispatch(CForgeSpec *spec, I64 parent_depth=0);
+extern Bool	SlotAcquire(I64 slot_type, I64 agent_id);
+extern U0	SlotRelease(I64 slot_type);

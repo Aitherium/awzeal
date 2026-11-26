@@ -450,12 +450,17 @@ U0 InferQueueDump()
 
 	for (i = 0; i < infer_queue.model_count; i++)
 	{
+		U8 *avail_st;
+		if (infer_queue.models[i].available)
+			avail_st = "YES";
+		else
+			avail_st = "NO";
 		"  [%d] %s  backend=%d quality=%d speed=%.1f avail=%s",
 			i, infer_queue.models[i].name,
 			infer_queue.models[i].backend,
 			infer_queue.models[i].quality,
 			infer_queue.models[i].speed,
-			infer_queue.models[i].available ? "YES" : "NO";
+			avail_st;
 		if (infer_queue.models[i].endpoint[0])
 			" endpoint=%s", infer_queue.models[i].endpoint;
 		"\n";

@@ -279,28 +279,28 @@ Bool MyPutKey(I64 ch, I64 sc)
 				if (sc & SCF_KEY_DESC)
 					KeyDescSet("Dol /π");
 				else
-					'π';
+					'\xE3';
 				return TRUE;
 
 			case '2':
 				if (sc & SCF_KEY_DESC)
 					KeyDescSet("Dol /Θ");
 				else
-					'Θ';
+					'\xE9';
 				return TRUE;
 
 			case '3':
 				if (sc & SCF_KEY_DESC)
 					KeyDescSet("Dol /Φ");
 				else
-					'Φ';
+					'\xE8';
 				return TRUE;
 
 			case '4':
 				if (sc & SCF_KEY_DESC)
 					KeyDescSet("Dol /Ω");
 				else
-					'Ω';
+					'\xEA';
 				return TRUE;
 
 			case '9':

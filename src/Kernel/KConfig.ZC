@@ -38,7 +38,7 @@ CDoc *KConfigAddDev(CKConfig *c)
 	"\n\nIn anticipation of the drives you will define shortly, enter the drive letter\n"
 	"of the drive with your Home directory. ($$PURPLE$$<ENTER>$$FG$$ for current drive) Boot Drive:";
 
-	ch = Letter2Letter(CharGet);
+	ch = 0; //ZealOS-AI headless: i8042 dead under -display none; use current drive
 	if ('A' <= ch <= 'Z')
 		c->boot_drive_let = ch;
 	else
@@ -172,10 +172,8 @@ CKConfig *KConfigNew()
 	c->add_dev = KConfigAddDev(c);
 	c->home_dir = StrNew("::/Home");
  
-	c->disk_cache_size_exp = StrGet("\nDisk Cache Size in Bytes, gets rounded-up funny, "
-									"($$PURPLE$$<ENTER>$$FG$$ will use default.):",
-									"Scale2Mem(0x80000,0x8000000)");
-	KConfigOptions(c);
+	c->disk_cache_size_exp = StrNew("Scale2Mem(0x80000,0x8000000)");
+	//ZealOS-AI headless: KConfigOptions skipped - no keyboard under -display none; all defaults
 
 	return c;
 }
