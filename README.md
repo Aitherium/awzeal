@@ -1,59 +1,72 @@
-# ZealOS
+# ZealOS-AI
 
-[![Discord](https://img.shields.io/discord/934200098144022609?color=7289DA&label=Discord&logo=discord&logoColor=white)](https://discord.gg/rK6U3xdr7D) [![](https://img.shields.io/badge/wiki-documentation-forestgreen)](https://zeal-operating-system.github.io/ZealOS-wiki/) [![Build ZealOS ISOs](https://github.com/Zeal-Operating-System/ZealOS/actions/workflows/build.yml/badge.svg)](https://github.com/Zeal-Operating-System/ZealOS/actions/workflows/build.yml)
+ZealOS with an LLM running in ring 0. You boot it and the OS answers questions. There is no Linux under it, no host doing the work, and no network call. The tokens come from the CPU, inside ZealOS.
 
-The Zeal Operating System is a modernized fork of the 64-bit Temple Operating System. Guiding principles of development include transparency, full user control, and adherence to public-domain/open-source implementations.
+![ZealOS-AI answering on the console](aipack/evidence/p3-answers.png)
 
-![](/screenshots/screenshot2.png)
+Measured 2026-11-26 on QEMU KVM, one core of a Ryzen 9 9950X3D:
 
-ZealOS strives to be simple, documented, and require as little of a knowledge gap as possible. One person should be able to comprehend the entire system in at least a semi-detailed way within a few days of study.
+```
+[AILLM] ready: engine 552640 B, model 613 MiB, ctx 1024, vocab 151936, load 102.59s
+The capital of France is Paris.
+ZLOUT-END prefill=24 tok 1.34s decode=7 tok 1.88s (3.72 tok/s) ctx=31/1024
+The capital of Germany is Berlin.          <- follow-up turn, same KV cache
+ZLOUT-END prefill=20 tok 0.47s decode=7 tok 0.37s (18.96 tok/s) ctx=60/1024
+```
 
-**Simplify, don't complicate; make accessible, don't obfuscate.**
+This is a fork of [ZealOS](https://github.com/Zeal-Operating-System/ZealOS), which is itself a modernized fork of TempleOS. The upstream README is kept in [UPSTREAM-README.md](UPSTREAM-README.md).
 
-Features in development include:
-  - [32-bit color VBE graphics](https://github.com/TempleProgramming/HolyGL)
-  - Fully-functional AHCI support
-  - Network card drivers and a networking stack
-  - UEFI booting via [BSD2-licensed Limine bootloader](https://github.com/limine-bootloader/limine) and [Public Domain ZealBooter prekernel](/zealbooter/src/zealbooter.c)
+## What works today
 
-[Changes include](https://zeal-operating-system.github.io/Doc/ChangeLog.DD.html):
-  - 60 FPS
-  - VBE graphics with variable resolutions
-  - Reformatted code for readability
-  - Added comments and documentation
-  - HolyC -> ZealC
-  - System-wide renaming for clarity
+| piece | status |
+|---|---|
+| Qwen3-0.6B (Q8_0) inference in ring 0 | **works**: multi-turn chat with a retained KV cache, about 19 tok/s on one core |
+| `AIAsk(prompt)` / `AIChat` from the ZealOS shell | **works** |
+| Boot-to-answer autostart from the live ISO | **works**: the autostart mounts the AI-pack SATA disk and runs it |
+| Answers mirrored to COM1 (`ZLOUT-BEGIN` / `ZLOUT-END`) | **works**: this is how CI and the host scripts verify a run |
+| Multi-core inference (ZealOS JobQueue) | in progress |
+| Agent kernel layer (FluxIDT, CapEngine, AgentForge, InferQueue): see [ZEALOS-AI.md](ZEALOS-AI.md) | source is in `src/Kernel`; its kernel build is not proven yet, and that doc's performance table is a design target, not a measurement |
+| Bonsai 2.5 27B (ternary, `qwen35` hybrid architecture) | planned: needs a second engine |
 
-## Getting started
+## How it works
 
-### Prerequisites
+The engine is [llm.asm](https://github.com/alesha-pro/llm.asm)'s Qwen3 forward pass, written in pure x86-64 AVX2/FMA assembly. We wrap it as a flat, position-independent blob (`ENGINE.BIN`) with a HolyC calling convention, so ZealOS code calls it through plain function pointers. ZealOS never turns AVX on, so every entry point enables it (CR4.OSXSAVE plus XCR0) on whatever core it lands on.
 
-- For running in a VM: Intel VT-x/AMD-V acceleration enabled in your BIOS settings. (Required to virtualize any 64-bit operating system properly.)
-    * If using Windows, [Hyper-V must be enabled.](https://docs.microsoft.com/en-us/virtualization/hyper-v-on-windows/quick-start/enable-hyper-v#enable-the-hyper-v-role-through-settings)
-- Working knowledge of the C programming language.
+`AILLM.ZC` is the HolyC side. It loads the engine and the model into memory, binds the entry points and streams tokens to the console. Everything is in [`aipack/`](aipack/README.md).
 
-To create a Distro ISO, run the `build-iso` script. Check the Wiki guide for details on [building an ISO](https://zeal-operating-system.github.io/ZealOS-wiki/Building-an-ISO). After creating an ISO, see the Wiki guides on installing in [VirtualBox](https://zeal-operating-system.github.io/ZealOS-wiki/Installing-(Virtualbox)), [VMWare](https://zeal-operating-system.github.io/ZealOS-wiki/Installing-(VMWare)), and [bare-metal](https://zeal-operating-system.github.io/ZealOS-wiki/Installing-(Bare%E2%80%90metal)).
+```
+ZealOS shell / agent
+   |  AIAsk("...")                       HolyC  (aipack/zealos/AILLM.ZC)
+   v
+ENGINE.BIN  ZlBegin -> ZlNext ... -> ZlEnd    x86-64 AVX2  (aipack/engine/zeal_glue.asm + llm.asm)
+   |
+   v
+QWEN3.BIN  (.asmbin, 614 MiB, read from the FAT32 AI-pack disk)
+```
 
-### Contributing
+## Try it
 
-There are two ways to contribute. The first way involves everything happening inside the OS, as intended by Terry. After you've built the latest ISO, installed to a VM, made your changes, and powered off the VM, you can run the `sync` script to merge your changes to the repo.
+You need a Linux host with KVM, podman and QEMU, and a CPU with AVX2 + FMA + F16C.
 
-Alternatively, you can edit repo files using an external editor, outside of the OS.
+```bash
+bash aipack/host/fetch-and-export.sh          # Qwen3-0.6B -> .asmbin
+bash aipack/host/z.sh engine                  # build ENGINE.BIN
+bash aipack/host/z.sh disk                    # FAT32 AI-pack disk
+bash aipack/host/z.sh iso                     # live ISO with the AI autostart
+bash aipack/host/z.sh run @aipack/steps/proof.txt
+```
 
-Afterwards, you can make a pull request on the `master` branch.
+The full walkthrough and the traps we hit are in [aipack/README.md](aipack/README.md).
 
-## Background
+## Roadmap
 
-In around November of 2019, [VoidNV](https://web.archive.org/web/20210414181948/https://github.com/VoidNV) forked [ZenithOS](https://web.archive.org/web/20200811190005/https://github.com/VoidNV/ZenithOS) from TempleOS. [Releases of pre-git ZenithOS are currently archived on the mega.nz website.](https://mega.nz/#F!ZIEGmSRQ!qvL6Wk6THzE-dazkfT6N3Q) The repository was removed in August of 2020, and reuploaded to [ZenithOS](https://web.archive.org/web/20210630230454/https://github.com/ZenithOS/ZenithOS). The latest archived [front page](https://web.archive.org/web/20200811190005/https://github.com/VoidNV/ZenithOS/), [master.zip](https://web.archive.org/web/20200811190054/https://codeload.github.com/VoidNV/ZenithOS/zip/master), and [related links](https://web.archive.org/web/*/https://github.com/VoidNV/ZenithOS/*) can be found on archive.org.
+1. Use every core: shard the matmul and attention ranges across ZealOS CPUs with JobQueue.
+2. Make the kernel `InferQueue` / `InferSync` call the local engine, so spawned agents think locally.
+3. Run Bonsai 2.5 27B in ring 0, which needs a second engine for the `qwen35` architecture (Gated DeltaNet plus gated attention, Hadamard-rotated `PQ2_0` ternary weights, 8.3 GB).
 
-In July of 2021, ZealOS was forked from ZenithOS.
+## Credits and licences
 
-## Screenshots
-
-Network Report, Gopher Client, FTP Client, GrDir, and AutoComplete, with Stars wallpaper
-
-![](/screenshots/screenshot3.png)
-
-32-bit color!
-
-![](/screenshots/screenshot1.png)
+- ZealOS / TempleOS: public domain (Unlicense). See [LICENSE](LICENSE).
+- llm.asm: MIT, (c) alesha-pro. The engine sources are fetched at build time.
+- Qwen3-0.6B: Apache-2.0, Qwen team. The weights are downloaded at build time and never committed.
+- ZealOS-AI additions: Aitherium.
