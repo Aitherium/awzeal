@@ -36,7 +36,8 @@ global tp_gqa_attn
 global zl_header
 
 ZL_MAGIC   equ 0x31454C5A           ; "ZLE1"
-ZL_VERSION equ 1
+ZL_VERSION equ 2
+ZL_MAX_CPUS equ 64
 
 section .text.zhdr progbits alloc exec nowrite align=64
 ; ---- fixed header: AILLM.ZC reads these fields at the image base ----------
@@ -49,6 +50,8 @@ zl_header:
     dd zl_end   - zl_header         ; +20  I64 ZlEnd()                              -> ctx position
     dd zl_reset - zl_header         ; +24  I64 ZlReset()
     dd zl_stat  - zl_header         ; +28  I64 ZlStat(I64 which)
+    dd zl_worker - zl_header        ; +32  I64 ZlWorker(I64 tid)   run jobs on this core; returns after ~20 ms idle
+    dd zl_threads - zl_header       ; +36  I64 ZlThreads(I64 n)    n = BSP + workers (1 = single core)
     times 64 - ($ - zl_header) db 0
 
 %macro HC_ENTER 0
@@ -295,6 +298,101 @@ zl_stat:
 .r:
     HC_LEAVE 8
 
+; I64 ZlThreads(I64 n) -- cores used per matmul/attention (BSP + n-1 workers)
+zl_threads:
+    HC_ENTER
+    mov     rax, HC_ARG(1)
+    cmp     rax, 1
+    jge     .lo
+    mov     eax, 1
+.lo:
+    cmp     rax, ZL_MAX_CPUS
+    jle     .hi
+    mov     eax, ZL_MAX_CPUS
+.hi:
+    mov     [rel tp_n_threads], rax
+    HC_LEAVE 8
+
+; I64 ZlWorker(I64 tid) -- called in a loop by a ZealOS task pinned to one
+; core. Runs every job slice for tid until ~20 ms pass with no job, then
+; returns jobs-done so the task can Yield. Uses the task's own stack (each
+; core needs its own), re-aligned for AVX.
+zl_worker:
+    push    rbp
+    mov     rbp, rsp
+    push    rbx
+    push    rcx
+    push    rdx
+    push    rsi
+    push    rdi
+    push    r8
+    push    r9
+    push    r10
+    push    r11
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    sub     rsp, 8
+    stmxcsr [rsp]
+    mov     rax, rsp
+    and     rsp, -32
+    push    rax
+    sub     rsp, 24
+    call    zl_enable_avx
+    ldmxcsr [rel zl_mxcsr_default]
+    mov     r12, HC_ARG(1)              ; tid
+    lea     r13, [rel tp_done_arr]
+    mov     rcx, r12
+    shl     rcx, 6
+    add     r13, rcx                    ; &done[tid]
+    xor     r15d, r15d                  ; jobs done this call
+.idle_reset:
+    mov     rbx, 4000000                ; ~20 ms of pause
+.wait:
+    mov     eax, [rel tp_gen]
+    cmp     eax, [r13]
+    jne     .job
+    pause
+    dec     rbx
+    jnz     .wait
+    jmp     .out
+.job:
+    mov     r14d, eax
+    mov     rsi, [rel tp_n_threads]
+    cmp     r12, rsi
+    jae     .mark
+    mov     rdi, r12
+    mov     rcx, [rel tp_M]
+    call    tp_slice
+    call    tp_run_slice
+    inc     r15
+.mark:
+    mov     [r13], r14d                 ; TSO release: this core's slice is done
+    jmp     .idle_reset
+.out:
+    mov     rax, r15
+    vzeroupper
+    add     rsp, 24
+    pop     rsp
+    ldmxcsr [rsp]
+    add     rsp, 8
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     r11
+    pop     r10
+    pop     r9
+    pop     r8
+    pop     rdi
+    pop     rsi
+    pop     rdx
+    pop     rcx
+    pop     rbx
+    pop     rbp
+    ret     8
+
 section .text
 
 ; ---- OS shim for the shared engine (SysV ABI) -------------------------------
@@ -351,8 +449,98 @@ str_len:
 .ret:
     ret
 
-; void tp_matmul_q8_0(W, x, out, M, K) -- single-core dispatch (ZealOS owns
-; the APs; multi-core goes through JobQueue later)
+; ---- multi-core dispatch -----------------------------------------------------
+; Same lock-free generation/spin-barrier design as llm.asm smp.asm, but the
+; workers are ZealOS tasks pinned to CPUs 1..n-1 that sit in ZlWorker(tid).
+; tid 0 is the calling (BSP) task. tp_K = 0 marks an attention job.
+
+; (rax = r0, rdx = r1) = slice of M for tid rdi out of n rsi; M in rcx
+tp_slice:
+    push    rbx
+    mov     rbx, rcx                    ; M
+    mov     rax, rcx
+    imul    rax, rdi
+    lea     rax, [rax + rsi - 1]
+    xor     edx, edx
+    div     rsi
+    mov     r8, rax                     ; r0
+    lea     rax, [rdi + 1]
+    cmp     rax, rsi
+    je      .last
+    imul    rax, rbx
+    lea     rax, [rax + rsi - 1]
+    xor     edx, edx
+    div     rsi
+    mov     rdx, rax
+    jmp     .out
+.last:
+    mov     rdx, rbx
+.out:
+    mov     rax, r8
+    pop     rbx
+    ret
+
+; run job slice [r0=rax, r1=rdx) using the tp_* parameters
+tp_run_slice:
+    cmp     rdx, rax
+    jle     .ret
+    mov     r8, rax
+    mov     r9, rdx
+    mov     rdi, [rel tp_W]
+    mov     rsi, [rel tp_x]
+    mov     rdx, [rel tp_out]
+    mov     rcx, [rel tp_K]
+%if FAST_Q8
+    test    rcx, rcx
+    jz      .attn
+%endif
+    jmp     matmul_q8_0_range           ; (W, x, out, K, r0, r1)
+%if FAST_Q8
+.attn:
+    mov     rcx, r8                     ; h0
+    mov     r8, r9                      ; h1
+    jmp     gqa_attn_range
+%endif
+.ret:
+    ret
+
+; broadcast the job in tp_* to all workers, run slice 0 here, wait for all
+tp_dispatch:
+    push    rbx
+    push    r12
+    push    r13
+    mov     rbx, [rel tp_n_threads]
+    mov     r12d, 1
+    lock xadd dword [rel tp_gen], r12d
+    inc     r12d                        ; this job's generation
+    xor     edi, edi
+    mov     rsi, rbx
+    mov     rcx, [rel tp_M]
+    call    tp_slice
+    call    tp_run_slice
+    lea     rdi, [rel tp_done_arr]
+    mov     rcx, 1
+.wait_tid:
+    cmp     rcx, rbx
+    jae     .done
+    mov     rdx, rcx
+    shl     rdx, 6
+.spin:
+    cmp     dword [rdi + rdx], r12d
+    je      .next
+    pause
+    jmp     .spin
+.next:
+    inc     rcx
+    jmp     .wait_tid
+.done:
+    lfence
+    pop     r13
+    pop     r12
+    pop     rbx
+    ret
+
+; void tp_matmul_q8_0(W, x, out, M, K)
 tp_matmul_q8_0:
 %if FAST_Q8
     push    rdi
@@ -362,13 +550,25 @@ tp_matmul_q8_0:
     push    r8
     mov     rdi, rsi
     mov     rsi, r8
-    call    quantize_x_q8_0
+    call    quantize_x_q8_0             ; once, shared by every core
     pop     r8
     pop     rcx
     pop     rdx
     pop     rsi
     pop     rdi
 %endif
+    cmp     qword [rel tp_n_threads], 1
+    jle     .single
+    mov     [rel tp_W], rdi
+    mov     [rel tp_x], rsi
+    mov     [rel tp_out], rdx
+    mov     [rel tp_M], rcx
+    mov     [rel tp_K], r8
+    sub     rsp, 8
+    call    tp_dispatch
+    add     rsp, 8
+    ret
+.single:
     mov     r9, rcx                     ; r1 = M
     mov     rcx, r8                     ; K
     xor     r8d, r8d                    ; r0 = 0
@@ -377,6 +577,18 @@ tp_matmul_q8_0:
 %if FAST_Q8
 ; void tp_gqa_attn(layer_kv_base, pos, scale_gqa_packed, n_heads)
 tp_gqa_attn:
+    cmp     qword [rel tp_n_threads], 1
+    jle     .single
+    mov     [rel tp_W], rdi
+    mov     [rel tp_x], rsi
+    mov     [rel tp_out], rdx
+    mov     [rel tp_M], rcx
+    mov     qword [rel tp_K], 0
+    sub     rsp, 8
+    call    tp_dispatch
+    add     rsp, 8
+    ret
+.single:
     mov     r8, rcx
     xor     ecx, ecx
     jmp     gqa_attn_range
@@ -397,6 +609,17 @@ zl_next_tok:       resq 1
 zl_n_gen:          resq 1
 zl_max_tok:        resq 1
 zl_last_unfed:     resq 1
+alignb 64
+tp_gen:            resd 1
+alignb 8
+tp_n_threads:      resq 1
+tp_W:              resq 1
+tp_x:              resq 1
+tp_out:            resq 1
+tp_M:              resq 1
+tp_K:              resq 1
+alignb 64
+tp_done_arr:       resb ZL_MAX_CPUS * 64
 alignb 64
 zl_stack:          resb 512 * 1024
 zl_stack_top:

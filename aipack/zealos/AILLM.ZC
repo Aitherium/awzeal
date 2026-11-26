@@ -18,8 +18,8 @@ class CZlEngine
 {
 	U8		*image, *model, *arena;
 	I64		 image_size, model_size, arena_size;
-	Bool	 ready, think;
-	I64		 lock;
+	Bool	 ready, think, workers_run;
+	I64		 lock, threads;
 };
 
 CZlEngine zl;
@@ -29,6 +29,36 @@ I64 (*ZlNext)(U8 *buf, I64 cap);
 I64 (*ZlEnd)();
 I64 (*ZlReset)();
 I64 (*ZlStat)(I64 which);
+I64 (*ZlWorker)(I64 tid);
+I64 (*ZlThreads)(I64 n);
+
+U0 ZlWorkerTask(U8 *data)
+{// Pinned to one core: run engine job slices, Yield between idle spells.
+	I64 tid = data;
+	while (zl.workers_run)
+	{
+		(*ZlWorker)(tid);
+		Yield;
+	}
+}
+
+I64 AILLMThreads(I64 n=0)
+{// Use n cores for inference (0 = every core). Returns the count in use.
+	I64 i;
+	if (!zl.ready)
+		return 0;
+	if (n <= 0 || n > mp_count)
+		n = mp_count;
+	(*ZlThreads)(1);
+	zl.workers_run = FALSE;
+	Sleep(100);
+	zl.workers_run = TRUE;
+	for (i = 1; i < n; i++)
+		Spawn(&ZlWorkerTask, i, "AILLM worker", i);
+	zl.threads = n;
+	(*ZlThreads)(n);
+	return n;
+}
 
 U0 ZlSerInit()
 {
@@ -141,6 +171,8 @@ Bool AILLMLoad(U8 *engine_path="ENGINE.BIN", U8 *model_path="QWEN3.BIN")
 	ZlEnd	= zl.image + (zl.image(U32 *))[5];
 	ZlReset	= zl.image + (zl.image(U32 *))[6];
 	ZlStat	= zl.image + (zl.image(U32 *))[7];
+	ZlWorker	= zl.image + (zl.image(U32 *))[8];
+	ZlThreads	= zl.image + (zl.image(U32 *))[9];
 
 	zl.model = ZlReadAligned(model_path, &zl.model_size);
 	if (!zl.model)
@@ -160,8 +192,9 @@ Bool AILLMLoad(U8 *engine_path="ENGINE.BIN", U8 *model_path="QWEN3.BIN")
 		return FALSE;
 	}
 	zl.ready = TRUE;
-	StrPrint(msg, "[AILLM] ready: engine %d B, model %d MiB, ctx %d, vocab %d, load %0.2fs\n",
-			 zl.image_size, zl.model_size >> 20, (*ZlStat)(1), (*ZlStat)(3), tS - t0);
+	AILLMThreads(0);
+	StrPrint(msg, "[AILLM] ready: engine %d B, model %d MiB, ctx %d, vocab %d, cores %d, load %0.2fs\n",
+			 zl.image_size, zl.model_size >> 20, (*ZlStat)(1), (*ZlStat)(3), zl.threads, tS - t0);
 	ZlLog(msg);
 	return TRUE;
 }
@@ -204,8 +237,8 @@ I64 AIAsk(U8 *prompt, U8 *out=NULL, I64 out_cap=0, Bool echo=TRUE)
 	}
 	(*ZlEnd)();
 	t2 = tS;
-	StrPrint(msg, "\nZLOUT-END prefill=%d tok %0.2fs decode=%d tok %0.2fs (%0.2f tok/s) ctx=%d/%d\n",
-			 n_prompt, t1 - t0, n_gen, t2 - t1, n_gen / (t2 - t1 + 0.0001), (*ZlStat)(0), (*ZlStat)(1));
+	StrPrint(msg, "\nZLOUT-END prefill=%d tok %0.2fs decode=%d tok %0.2fs (%0.2f tok/s) ctx=%d/%d cores=%d\n",
+			 n_prompt, t1 - t0, n_gen, t2 - t1, n_gen / (t2 - t1 + 0.0001), (*ZlStat)(0), (*ZlStat)(1), zl.threads);
 	ZlSerPut(msg);
 	if (echo)
 		"%s", msg;
